@@ -25,6 +25,12 @@ reports/      deliverable.md  status.md  retro.json
 - 읽기 전용 가드: 단일 문, SELECT/WITH/DESCRIBE/SHOW/PIVOT/SUMMARIZE/FROM만, `read_*`·`copy`·`attach`·`pragma` 등 차단, DuckDB `enable_external_access=false`. 더 넓은 작업(학습·시각화)은 `lake/parquet/*.parquet`를 polars·duckdb로 직접 열어 별도 스크립트로 수행하고, 결과를 신규 근거로 남기려면 SQL 근거(아래)로 재현 가능하게 만드십시오.
 - **SQL 근거**: DataAnalyst가 `sql`+`result_sha`(`--hash`가 출력, 행 순서 무관·소수 6자리 반올림 기준)를 제출하면 `load`가 데이터셋에 재실행해 해시가 다르면 거부합니다. 데이터셋은 등록 시 DuckDB로 Parquet 변환·프로파일(행·열·null·표본) 생성, 프로파일은 출처 텍스트(`raw/S*.txt`)로도 저장됩니다.
 
+## 엔진 변경을 기존 run 원장으로 평가하기
+
+- 실제 `runs/*/ledger.sqlite`는 열어 두지 말고 읽기 전용 URI로 연결해 사본을 만든 뒤 사본에만 질의하십시오: `sqlite3.connect(f'file:{src}?mode=ro', uri=True).backup(dst_conn)`. 평가가 끝나면 사본을 지웁니다(연구 자료가 들어 있음).
+- 변경 전 동작이 만든 행을 변경 후 규칙으로 분류할 때, 출처 표기(`contradictions.note` 등)가 과거 `resolve --note`에 덮여 있으면 행 단위 귀속이 불가능합니다. 이때는 claim 단위로 보수적으로 분류하십시오(그 claim의 챌린지가 모두 `stands`/`inconclusive`면 "새 규칙에서는 생성되지 않음", weakened/refuted가 하나라도 있으면 "판별 불가, 제외", 챌린지 없는 행은 분석가 기원으로 영향 없음). 수치에는 정의를 함께 적고 이전에 보고한 다른 정의의 수치와 섞어 비교하지 마십시오.
+- 순방향 수정은 과거 행을 바꾸지 않습니다. 원장 이관은 별도 설계 없이 하지 마십시오.
+
 ## 불변식
 
 - **역추적 경로**: quote 근거는 `[K] → claim_evidence → evidence.quote → raw/S*.txt`(원문 부분 문자열), SQL 근거는 `[K] → claim_evidence → evidence.sql/result_sha → datasets/<name>.parquet`(재실행 해시). SQL 근거의 quote 필드는 재현 문자열이며 raw 텍스트의 부분 문자열이 아닙니다.
