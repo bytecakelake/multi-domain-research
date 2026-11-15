@@ -311,23 +311,82 @@ def cmd_reopen(a):
     return 0
 
 
-def cmd_resolve(a):
-    run = _run(a)
-    if a.status not in ("resolved", "disclosed"):
-        die("--status must be resolved|disclosed")
+RESOLVE_STATUSES = ("resolved", "disclosed")
+
+
+def _read_resolve_file(run, path) -> list[tuple[str, str, str | None]]:
+    """Parse and fully validate a resolve JSONL file; die listing every offending line before anything is written."""
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig")
+    except OSError as e:
+        die(f"cannot read --file {path}: {e}")
+    known = {x["id"] for x in run.q("SELECT id FROM contradictions")}
+    rows, errors, first_seen = [], [], {}
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError as e:
+            errors.append(f"line {n}: malformed JSON ({e})")
+            continue
+        if not isinstance(d, dict):
+            errors.append(f"line {n}: not a JSON object")
+            continue
+        cid, status, note = d.get("id"), d.get("status"), d.get("note")
+        if not isinstance(cid, str) or not cid or not isinstance(status, str) or not status:
+            errors.append(f"line {n}: missing id or status")
+        elif status not in RESOLVE_STATUSES:
+            errors.append(f"line {n}: invalid status {status!r} (resolved|disclosed)")
+        elif note is not None and not isinstance(note, str):
+            errors.append(f"line {n}: note must be a string")
+        elif cid not in known:
+            errors.append(f"line {n}: unknown contradiction {cid}")
+        elif cid in first_seen:
+            errors.append(f"line {n}: duplicate id {cid} (first on line {first_seen[cid]})")
+        else:
+            first_seen[cid] = n
+            rows.append((cid, status, note))
+    if not errors and not rows:
+        errors.append("no rows in file")
+    if errors:
+        die("--file rejected, nothing changed:\n  " + "\n  ".join(errors))
+    return rows
+
+
+def _apply_resolutions(run, rows) -> None:
+    """Shared by single and batch mode: one transaction; status-only update + event per row, claims recomputed once."""
     run.db.execute("BEGIN")
     try:
-        x = run.one("SELECT * FROM contradictions WHERE id=?", (a.id,))
-        if not x:
-            die(f"unknown contradiction: {a.id}")
-        run.db.execute("UPDATE contradictions SET status=? WHERE id=?", (a.status, a.id))  # provenance note is never overwritten
-        run.event("contradiction_resolved", None, contradiction_id=a.id, claim_id=x["claim_id"], evidence_id=x["evidence_id"],
-                  old_status=x["status"], new_status=a.status, resolution_note=a.note, provenance_note=x["note"])
+        for cid, status, note in rows:
+            x = run.one("SELECT * FROM contradictions WHERE id=?", (cid,))
+            if not x:
+                die(f"unknown contradiction: {cid}")
+            run.db.execute("UPDATE contradictions SET status=? WHERE id=?", (status, cid))  # provenance note is never overwritten
+            run.event("contradiction_resolved", None, contradiction_id=cid, claim_id=x["claim_id"], evidence_id=x["evidence_id"],
+                      old_status=x["status"], new_status=status, resolution_note=note, provenance_note=x["note"])
         ingest.recompute_claims(run)
         run.db.execute("COMMIT")
     except BaseException:
         run.db.execute("ROLLBACK")
         raise
+
+
+def cmd_resolve(a):
+    run = _run(a)
+    path = getattr(a, "file", None)
+    if path:
+        if a.id or a.status or a.note:
+            die("--file cannot be combined with --id/--status/--note")
+        rows = _read_resolve_file(run, path)
+        _apply_resolutions(run, rows)
+        print(f"{len(rows)} contradictions updated")
+        return 0
+    if not a.id or not a.status:
+        die("give either --file F.jsonl or both --id and --status")
+    if a.status not in RESOLVE_STATUSES:
+        die("--status must be resolved|disclosed")
+    _apply_resolutions(run, [(a.id, a.status, a.note)])
     print(f"{a.id} -> {a.status}")
     return 0
 
@@ -469,7 +528,9 @@ def build_parser():
     s.add_argument("--claim", required=True); s.add_argument("--strength", required=True); s.add_argument("--reason", required=True); s.set_defaults(fn=cmd_downgrade)
     s = sub.add_parser("reopen", parents=[common], help="force another wave of a block"); s.add_argument("--block", required=True); s.add_argument("--note"); s.set_defaults(fn=cmd_reopen)
     s = sub.add_parser("resolve", parents=[common], help="resolve/disclose a contradiction")
-    s.add_argument("--id", required=True); s.add_argument("--status", required=True); s.add_argument("--note"); s.set_defaults(fn=cmd_resolve)
+    s.add_argument("--id", help="single mode: contradiction id (e.g. X0001)"); s.add_argument("--status", help="single mode: resolved|disclosed"); s.add_argument("--note", help="single mode: reason")
+    s.add_argument("--file", help='batch mode: JSONL, one {"id":"X0001","status":"resolved|disclosed","note":"..."} per line; exclusive with --id/--status/--note; all-or-nothing')
+    s.set_defaults(fn=cmd_resolve)
     s = sub.add_parser("gate", parents=[common], help="evaluate gates"); s.add_argument("name", nargs="?"); s.add_argument("--block"); s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_gate)
     s = sub.add_parser("lake", parents=[common], help="build/locate the DuckDB+Parquet lake"); s.add_argument("action", choices=["build", "path"]); s.set_defaults(fn=cmd_lake)
     s = sub.add_parser("sql", parents=[common], help="read-only SQL over the lake")

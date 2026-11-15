@@ -347,6 +347,112 @@ cli.cmd_resolve(argparse.Namespace(run=str(r.root), id=x["id"], status="resolved
 r = core.Run(r.root)
 check(r.one("SELECT note n FROM contradictions WHERE id=?", (x["id"],))["n"] == prov, "E1 resolve without note keeps provenance")
 
+import time
+# 22 E9: batch resolve --file
+r, k, (e1, e2, e3), at = e1_run("e9")
+CT = {}
+def e9_add(n):
+    ids = []
+    for i in range(n):
+        x = r.nid("X")
+        r.db.execute("INSERT INTO contradictions(id,claim_id,evidence_id,status,note) VALUES(?,?,?,?,?)", (x, k, e3, "open", f"prov {i}"))
+        ids.append(x)
+    return ids
+def e9_ns(**kw):
+    return argparse.Namespace(**{"run": str(r.root), "id": None, "status": None, "note": None, "file": None, **kw})
+def e9_file(name, lines):
+    p = BASE / name; p.write_text("\n".join(lines) + "\n", encoding="utf-8"); return str(p)
+SHARED = []
+def e9_snap():
+    rr = SHARED[0] if SHARED else core.Run(r.root)
+    return ([tuple(x) for x in rr.db.execute("SELECT id,status,note FROM contradictions ORDER BY id").fetchall()],
+            rr.one("SELECT COUNT(*) n FROM events WHERE kind='contradiction_resolved'")["n"], rr.one("SELECT COUNT(*) n FROM events")["n"])
+def e9_rej(**kw):
+    before = e9_snap()
+    try:
+        cli.cmd_resolve(e9_ns(**kw)); raised = False
+    except core.RlabError as ex:
+        raised = str(ex)
+    return raised, e9_snap() == before
+ids = e9_add(4)
+J = lambda i, s, n=None: json.dumps({"id": i, "status": s, **({"note": n} if n is not None else {})}, ensure_ascii=False)
+prov0 = {x["id"]: x["note"] for x in r.q("SELECT id, note FROM contradictions")}
+calls = []
+_orig_rc = ingest.recompute_claims
+ingest.recompute_claims = lambda run: (calls.append(1), _orig_rc(run))[1]
+f = e9_file("e9ok.jsonl", [J(ids[0], "resolved", "사유 A"), J(ids[1], "disclosed", "사유 B"), J(ids[2], "resolved")])
+check(cli.cmd_resolve(e9_ns(file=f)) == 0, "E9 batch resolve returns 0")
+ingest.recompute_claims = _orig_rc
+rr = core.Run(r.root)
+st = {x["id"]: x["status"] for x in rr.q("SELECT id,status FROM contradictions")}
+evs = [json.loads(e["d"]) for e in rr.q("SELECT detail d FROM events WHERE kind='contradiction_resolved' ORDER BY id")]
+check(st[ids[0]] == "resolved" and st[ids[1]] == "disclosed" and st[ids[2]] == "resolved" and st[ids[3]] == "open", "E9 batch sets each row's status; others stay open")
+check([e["contradiction_id"] for e in evs] == ids[:3] and [e["resolution_note"] for e in evs] == ["사유 A", "사유 B", None]
+      and all(e["claim_id"] == k and e["evidence_id"] == e3 and e["old_status"] == "open" and e["provenance_note"] == prov0[e["contradiction_id"]] for e in evs)
+      and [e["new_status"] for e in evs] == ["resolved", "disclosed", "resolved"], "E9 batch events carry each row's note and same detail fields as single mode")
+check(all(x["note"] == prov0[x["id"]] for x in rr.q("SELECT id,note FROM contradictions")), "E9 batch leaves provenance notes untouched")
+check(len(calls) == 1, f"E9 batch recomputes claims exactly once (calls={len(calls)})")
+# argument exclusivity
+rej, same = e9_rej(file=f, id=ids[3], status="resolved")
+check(rej and same, "E9 --file with --id/--status rejected without changes")
+rej, same = e9_rej(file=f, note="x")
+check(rej and same, "E9 --file with --note rejected without changes")
+rej, same = e9_rej()
+check(rej and same, "E9 neither --file nor --id rejected")
+# whole-file rejection
+bad = {"malformed": [J(ids[3], "resolved", "ok"), "{not json"],
+       "unknown": [J(ids[3], "resolved", "ok"), J("X9999", "resolved", "n")],
+       "badstatus": [J(ids[3], "resolved", "ok"), J(ids[0], "open", "n")],
+       "dup": [J(ids[3], "resolved", "ok"), J(ids[3], "disclosed", "again")],
+       "missing": [J(ids[3], "resolved", "ok"), json.dumps({"id": ids[0]}), json.dumps({"status": "resolved"})]}
+for name, lines in bad.items():
+    rej, same = e9_rej(file=e9_file(f"e9_{name}.jsonl", lines))
+    check(rej and same and "line 2" in rej, f"E9 {name} line rejects whole file with line number, no changes")
+rej, _ = e9_rej(file=e9_file("e9_multi.jsonl", ["{x", J("X9999", "resolved"), J(ids[3], "bogus")]))
+check(rej and all(f"line {n}" in rej for n in (1, 2, 3)), "E9 reject message lists all offending line numbers")
+rej, same = e9_rej(file=str(BASE / "nope.jsonl"))
+check(rej and same, "E9 missing file rejected")
+rej, same = e9_rej(file=e9_file("e9_empty.jsonl", []))
+check(rej and same, "E9 empty file rejected")
+# injected failure mid-batch rolls back everything
+ids2 = e9_add(5)
+fb = e9_file("e9inj.jsonl", [J(i, "resolved", f"n{j}") for j, i in enumerate(ids2)])
+SHARED.append(core.Run(r.root)); _orig_run = cli._run; cli._run = lambda a: SHARED[0]  # same connection: leaked uncommitted writes would be visible
+before = e9_snap()
+_orig_ev = core.Run.event; n_ev = []
+def flaky(self, kind, task_id=None, **d):
+    n_ev.append(1)
+    if len(n_ev) == 3: raise RuntimeError("boom")
+    return _orig_ev(self, kind, task_id, **d)
+core.Run.event = flaky
+try:
+    cli.cmd_resolve(e9_ns(file=fb)); boom = False
+except RuntimeError:
+    boom = True
+finally:
+    core.Run.event = _orig_ev
+check(boom and len(n_ev) == 3 and e9_snap() == before, "E9 failure on 3rd event rolls back all statuses and events")
+def rc_boom(run): raise RuntimeError("rc boom")
+ingest.recompute_claims = rc_boom
+try:
+    cli.cmd_resolve(e9_ns(file=fb)); boom = False
+except RuntimeError:
+    boom = True
+finally:
+    ingest.recompute_claims = _orig_rc
+check(boom and e9_snap() == before, "E9 failure in final recompute_claims rolls back all statuses and events")
+cli._run = _orig_run; SHARED.clear()
+# single mode unchanged through shared helper
+cli.cmd_resolve(e9_ns(id=ids2[0], status="disclosed", note="single"))
+check(core.Run(r.root).one("SELECT status s FROM contradictions WHERE id=?", (ids2[0],))["s"] == "disclosed", "E9 single-item mode still works")
+# 300-row performance
+big = e9_add(300)
+fbig = e9_file("e9big.jsonl", [J(i, "resolved" if j % 2 else "disclosed", f"note {j}") for j, i in enumerate(big)])
+t0 = time.time(); cli.cmd_resolve(e9_ns(file=fbig)); dt = time.time() - t0
+print(f"E9 300-row batch took {dt:.2f}s")
+check(dt < 30 and cnt(core.Run(r.root), "SELECT COUNT(*) n FROM contradictions WHERE status='open'") == 5, "E9 300-row batch under 30s, all 300 applied")
+check(core.Run(r.root).one("SELECT COUNT(*) n FROM events WHERE kind='contradiction_resolved'")["n"] == 3 + 1 + 300, "E9 300-row batch wrote 300 events")
+
 shutil.rmtree(BASE, ignore_errors=True)
 print("UNIT PASS" if all(RESULTS) else f"UNIT FAIL ({RESULTS.count(False)} of {len(RESULTS)})")
 sys.exit(0 if all(RESULTS) else 1)
