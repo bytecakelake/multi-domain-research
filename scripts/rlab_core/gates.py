@@ -161,6 +161,10 @@ def g_contradictions(run, block=None):
 KREF = re.compile(r"\[(K\d{4}(?:\s*[,;]\s*K\d{4})*)\]")
 
 
+# heading line (any level), optional numbering ("3.", "3)", "2.1"), title mentioning limitations / 한계 / 제한
+LIMITS_HEADING = re.compile(r"(?im)^#{1,6}[ \t]*(?:\d+(?:\.\d+)*[.)]?[ \t]*)?[^\n]*?(?:limitations?|한계|제한)")
+
+
 def g_citation(run, block=None):
     path = run.p("reports", "deliverable.md")
     if not path.exists():
@@ -171,7 +175,7 @@ def g_citation(run, block=None):
         cited.update(re.findall(r"K\d{4}", m.group(1)))
     known = {r["id"] for r in run.q("SELECT id FROM claims")}
     unknown = sorted(cited - known)
-    has_lim = re.search(r"(?im)^#+\s*(limitations|한계|제한)", text) is not None
+    has_lim = LIMITS_HEADING.search(text) is not None
     uncited = [ln for ln in text.splitlines() if len(ln.strip()) > 40 and not ln.lstrip().startswith("#") and not KREF.search(ln)]
     problems = []
     if unknown:

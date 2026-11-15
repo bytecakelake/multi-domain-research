@@ -29,7 +29,7 @@
 | claim_support | strong인데 supported가 아닌 주장, 또는 주장 0개 | 0 | 근거 보강(새 analyst wave) 또는 `rlab downgrade --claim K.... --strength moderate --reason "..."`(부모 전용, 강도를 낮추는 것만 허용, 사유는 claim scope·감사 로그에 남음). `waive`로 덮지 마십시오 |
 | challenge | 강도 ≥ moderate 주장 중 반증 기록이 없는 것 | 100% | adversary 추가 task |
 | contradictions | moderate 이상 주장에 open 모순 | 0 | `resolve --status resolved|disclosed` (사유 필수) |
-| citation | deliverable이 없거나, 존재하지 않는 `[K....]` 인용, 인용 0개, Limitations 절 없음(제목에 **리터럴 영문 `Limitations`** 문자열이 있어야 함 — `## 3. Limitations`처럼 번호·한국어를 덧붙여도 되지만 `## 한계`·`## 3. 한계`처럼 영문 단어 자체가 빠지면 "없음"으로 fail). **구조 검사만 합니다**(문장별 인용 여부·의미 일치는 보증하지 않음; `uncited_lines`는 정보용) | — | 산출물 수정, 문장↔주장 수동 검토 |
+| citation | deliverable이 없거나, 존재하지 않는 `[K....]` 인용, 인용 0개, Limitations 절 없음(제목 줄에 `Limitations`·`한계`·`제한` 중 하나가 있으면 인정 — `## 3. 한계`, `## 4. 연구의 한계와 제언` 등 번호·한국어 제목 허용). **구조 검사만 합니다**(문장별 인용 여부·의미 일치는 보증하지 않음; `uncited_lines`는 정보용) | — | 산출물 수정, 문장↔주장 수동 검토 |
 | pii | pii_status=flagged 출처 존재 | 0 | `source drop` / `set --pii clear` |
 
 hard 게이트는 블록 완료를 막고, soft는 재개방 또는 limitations 기록으로 끝납니다. `waive`는 모든 게이트에 대해 가능하지만 항상 `report`의 limitations에 나타납니다. 임계는 workflow `params`이며 `--set`으로 바꿉니다. 기본값은 경험적 출발점이고 많은 run으로 보정된 값이 아닙니다.

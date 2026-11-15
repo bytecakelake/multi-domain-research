@@ -200,6 +200,37 @@ check(dn.returncode == 0, "downgrade lowers strength" + ("" if dn.returncode == 
 r2 = core.Run.open(r.root) if hasattr(core.Run, "open") else r
 check(gates.g_claim_support(r2)["status"] == "pass" and "single origin group" in (r2.one("SELECT scope s FROM claims")["s"] or ""), "after downgrade the gate passes and the reason is kept in claim scope")
 
+# 18 E4: citation gate accepts numbered / Korean limitation headings (no English-only workaround)
+r = setup("citgate", ["extract-single", "analyze-claims"]); question(r); t = task(r, "extract-single", None)
+sid = source(r, "abcdefghijk source content", "og")[2]; e = ev(r, t, sid)[1]; a = task(r, "analyze-claims", None)
+ingest.add_claim(r, {"text": "c", "question_id": "Q1", "ctype": "fact", "strength": "weak", "evidence_ids": [e]}, a, ctx_of(r, a))
+(r.p("reports")).mkdir(exist_ok=True)
+def cit(tail):
+    r.p("reports", "deliverable.md").write_text("# 결과\n\n- 근거 위에서 기술된 주장 문장 [K0001]\n\n" + tail, encoding="utf-8")
+    return gates.g_citation(r)["status"]
+for h in ["## 3. 한계", "## 한계", "### 3) 제한 사항", "## 4. 연구의 한계와 제언", "## 3. Limitations", "## Limitations"]:
+    check(cit(h + "\n\n- 내용\n") == "pass", f"citation gate accepts heading {h!r}")
+for h in ["## 3. 결론", "본문에서 한계를 말한다"]:
+    check(cit(h + "\n") == "fail", f"citation gate rejects non-limitations text {h!r}")
+
+# 19 E3: retry always records a reason; explicit note wins; automatic reason only from recorded facts
+r = setup("retryreason", ["scout"]); t = task(r, "scout", None)
+runtime.begin_task(r, t); r.db.execute("UPDATE tasks SET status='failed', notes=? WHERE id=?", ("HTTP 429 new-account-rpm", t))
+runtime.retry_task(r, t)
+n1 = r.one("SELECT notes n, attempts a FROM tasks WHERE id=?", (t,))
+check(n1["n"] and "failed" in n1["n"] and "HTTP 429 new-account-rpm" in n1["n"] and n1["n"].startswith("auto:"), "blank retry records automatic reason from prior status/notes")
+ev1 = json.loads(r.one("SELECT detail d FROM events WHERE kind='retry' ORDER BY id DESC")["d"])
+check(ev1.get("auto") is True and ev1.get("note") == n1["n"], "retry event flags the reason as automatic")
+r.db.execute("UPDATE tasks SET status='failed', notes=NULL WHERE id=?", (t,))
+runtime.retry_task(r, t, note="   ")
+n2 = r.one("SELECT notes n FROM tasks WHERE id=?", (t,))["n"]
+check(n2.startswith("auto:") and "no prior note" in n2 and "429" not in n2, "whitespace note + empty prior notes: auto reason does not invent a cause")
+r.db.execute("UPDATE tasks SET status='failed' WHERE id=?", (t,))
+runtime.retry_task(r, t, option="X", note="contract fixed")
+n3 = r.one("SELECT notes n FROM tasks WHERE id=?", (t,))["n"]
+ev3 = json.loads(r.one("SELECT detail d FROM events WHERE kind='retry' ORDER BY id DESC")["d"])
+check(n3 == "contract fixed" and not ev3.get("auto"), "explicit note is stored verbatim and not marked auto")
+
 shutil.rmtree(BASE, ignore_errors=True)
 print("UNIT PASS" if all(RESULTS) else f"UNIT FAIL ({RESULTS.count(False)} of {len(RESULTS)})")
 sys.exit(0 if all(RESULTS) else 1)
