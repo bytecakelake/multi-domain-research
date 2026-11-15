@@ -1,0 +1,3 @@
+{"id": "Q1", "text": "A와 B 중 집계 질의에서 어느 쪽이 빠른가?", "kind": "measure", "priority": 1, "labels": ["A_faster", "B_faster", "similar"], "label_defs": {"A_faster": "근거가 A가 더 빠르다는 결론을 지지", "B_faster": "근거가 B가 더 빠르다는 결론을 지지", "similar": "차이가 오차 범위라고 진술"}}
+{"id": "Q2", "text": "라이선스와 유지보수 상태는?", "kind": "describe", "priority": 1, "labels": ["permissive", "restrictive", "unclear"]}
+{"id": "Q2.1", "parent": "Q2", "text": "최근 12개월 릴리스 빈도는?", "kind": "measure", "labels": ["weekly", "monthly", "slower"]}

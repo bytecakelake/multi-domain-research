@@ -1,0 +1,16 @@
+{
+  "domain": "예: OSS 기술 (자유 기술 라벨)",
+  "direction": "예: 대안 비교 (자유 기술 라벨)",
+  "mode": "compare",
+  "modality": ["web", "code", "tabular"],
+  "verifiability": "checkable",
+  "stakes": "med",
+  "volume": "medium",
+  "volatility": "fast",
+  "noise": "low",
+  "ethics": "none",
+  "access": "open",
+  "quant": true,
+  "temporal": false,
+  "budget_tasks": null
+}
