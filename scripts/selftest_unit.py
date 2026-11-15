@@ -231,6 +231,122 @@ n3 = r.one("SELECT notes n FROM tasks WHERE id=?", (t,))["n"]
 ev3 = json.loads(r.one("SELECT detail d FROM events WHERE kind='retry' ORDER BY id DESC")["d"])
 check(n3 == "contract fixed" and not ev3.get("auto"), "explicit note is stored verbatim and not marked auto")
 
+# 20 E1: stands/inconclusive challenges must not create contradictions; weakened/refuted still do
+def e1_run(case, strength="moderate"):
+    r = setup(case, ["extract-single", "analyze-claims", "adversary"]); question(r)
+    t = task(r, "extract-single", None)
+    s1, s2, s3 = (source(r, f"abcdefghijk source {i} content", f"og{i}")[2] for i in (1, 2, 3))
+    e1, e2, e3 = ev(r, t, s1)[1], ev(r, t, s2)[1], ev(r, t, s3)[1]
+    a = task(r, "analyze-claims", None)
+    k = ingest.add_claim(r, {"text": "c", "question_id": "Q1", "ctype": "fact", "strength": strength, "evidence_ids": [e1, e2]}, a, ctx_of(r, a))[1]
+    ingest.recompute_claims(r)
+    return r, k, (e1, e2, e3), task(r, "adversary", None)
+
+def chal(r, k, tid, verdict, refs=None, note=None, found=False, **extra):
+    row = {"claim_id": k, "expected_falsifier": "f", "search_log": "q", "found": found, "verdict": verdict, **extra}
+    if refs is not None:
+        row["evidence_refs"] = refs
+    if note is not None:
+        row["note"] = note
+    return ingest.add_challenge(r, row, tid, ctx_of(r, tid))
+
+def cnt(r, sql="SELECT COUNT(*) n FROM contradictions"):
+    return r.one(sql)["n"]
+
+for verdict in ("stands", "inconclusive", "weakened", "refuted"):
+    for withref in (False, True):
+        r, k, (e1, e2, e3), at = e1_run(f"e1v-{verdict}-{withref}")
+        st, msg = chal(r, k, at, verdict, [e3] if withref else None)
+        genuine = verdict in ("weakened", "refuted")
+        if not withref and genuine:
+            check(st == "err", f"E1 {verdict} without refs rejected")
+            continue
+        check(st == "ok", f"E1 {verdict} refs={withref} accepted")
+        nx, nl = cnt(r), cnt(r, "SELECT COUNT(*) n FROM claim_evidence WHERE relation='refutes'")
+        check((nx, nl) == ((1, 1) if genuine else (0, 0)), f"E1 {verdict} refs={withref}: contradictions/refutes links = {(nx, nl)}")
+
+# original note preserved verbatim (unicode, multiline) + versioned context line with canonical deduped ids
+r, k, (e1, e2, e3), at = e1_run("e1note")
+t = dict(r.one("SELECT * FROM tasks WHERE id=?", (at,)))
+note = "반증 시도 — 결과 없음\n둘째 줄 \"quote\""
+st, chid = ingest.add_challenge(r, {"claim_id": k, "expected_falsifier": "f", "search_log": "q", "found": False, "verdict": "stands", "note": note,
+                                    "evidence_refs": ["ref1", e3, "ref1", e3, e1]}, at, {"task": t, "refs_ev": {"ref1": e3}})
+saved = r.one("SELECT note n FROM challenges WHERE id=?", (chid,))["n"]
+check(saved == note + "\n[rlab challenge-context v1] " + json.dumps({"evidence_ids": [e3, e1]}, ensure_ascii=False), "E1 note verbatim + context line with canonical deduped ids")
+check(chal(r, k, at, "stands", [e3])[0] == "ok" and r.one("SELECT note n FROM challenges ORDER BY id DESC")["n"] == "[rlab challenge-context v1] " + json.dumps({"evidence_ids": [e3]}), "E1 null note -> only context line")
+st, chid = chal(r, k, at, "stands", None, note="plain")
+check(r.one("SELECT note n FROM challenges WHERE id=?", (chid,))["n"] == "plain", "E1 stands without refs: note untouched")
+
+# validation unchanged
+r, k, (e1, e2, e3), at = e1_run("e1val")
+for verdict in ("stands", "inconclusive"):
+    st, msg = chal(r, k, at, verdict, ["E9999"])
+    check(st == "err" and "unknown evidence id" in msg, f"E1 {verdict} unknown evidence rejected")
+st, msg = chal(r, k, at, "stands", [e3], found=True)
+check(st == "err" and "found=true" in msg, "E1 stands + found=true rejected")
+check(chal(r, "K9999", at, "stands")[0] == "err" and cnt(r, "SELECT COUNT(*) n FROM challenges") == 0, "E1 rejected challenges leave no rows")
+
+# analyst contradiction survives a later stands challenge; status/gate change only for genuine contradictions
+r, k, (e1, e2, e3), at = e1_run("e1surv")
+a2 = task(r, "analyze-claims", None)
+ingest.add_claim(r, {"text": "c", "question_id": "Q1", "ctype": "fact", "strength": "moderate", "evidence_ids": [e1, e2], "counter_evidence_ids": [e3]}, a2, ctx_of(r, a2))
+ingest.recompute_claims(r)
+check(cnt(r) == 1 and r.one("SELECT status s FROM claims")["s"] == "contested", "E1 analyst counter evidence contests claim")
+chal(r, k, at, "stands", [e3]); chal(r, k, at, "inconclusive", [e3]); ingest.recompute_claims(r)
+check(cnt(r, "SELECT COUNT(*) n FROM contradictions WHERE status='open' AND evidence_id='%s'" % e3) == 1 and cnt(r, "SELECT COUNT(*) n FROM claim_evidence WHERE relation='refutes'") == 1, "E1 analyst contradiction + refutes link survive later stands/inconclusive")
+check(r.one("SELECT status s FROM claims")["s"] == "contested" and gates.g_contradictions(r)["status"] == "fail", "E1 still contested / gate failing because of the analyst contradiction")
+r, k, (e1, e2, e3), at = e1_run("e1gate")
+chal(r, k, at, "stands", [e3]); chal(r, k, at, "inconclusive", [e3]); ingest.recompute_claims(r)
+check(r.one("SELECT status s FROM claims")["s"] != "contested" and gates.g_contradictions(r)["status"] == "pass", "E1 stands/inconclusive with refs: claim not contested, contradictions gate passes")
+r2, k2, (f1, f2, f3), at2 = e1_run("e1gate2"); chal(r2, k2, at2, "weakened", [f3]); ingest.recompute_claims(r2)
+check(r2.one("SELECT status s FROM claims")["s"] == "contested" and gates.g_contradictions(r2)["status"] == "fail", "E1 weakened still contests claim and fails gate")
+
+# inconclusive visible in limitations
+r, k, (e1, e2, e3), at = e1_run("e1lim")
+chal(r, k, at, "stands"); lim0 = runtime.report_md(r).split("## Limitations (auto)")[1]
+chal(r, k, at, "inconclusive", [e3], note="n"); lim1 = runtime.report_md(r).split("## Limitations (auto)")[1]
+check("inconclusive" not in lim0 and "inconclusive" in lim1 and k in lim1, "E1 inconclusive challenge appears in limitations; stands does not")
+
+# rejected load / check rolls back challenge note additions
+r, k, (e1, e2, e3), at = e1_run("e1roll")
+rows = [{"kind": "challenges", "claim_id": k, "expected_falsifier": "f", "search_log": "q", "found": False, "verdict": "stands", "evidence_refs": [e3], "note": "x"},
+        {"kind": "challenges", "claim_id": "K9999", "expected_falsifier": "f", "search_log": "q", "verdict": "stands"}]
+pth = BASE / "e1roll.jsonl"; pth.write_text("\n".join(json.dumps(x) for x in rows), encoding="utf-8")
+res = ingest.ingest_file(r, at, pth, commit=True, force_unproven=True)
+check(res["status"] == "failed" and cnt(r, "SELECT COUNT(*) n FROM challenges") == 0, "E1 rejected load rolls back challenge rows incl. context note")
+res = ingest.ingest_file(r, at, pth, commit=False, force_unproven=True, accept_rejects=True)
+check(res["status"] == "check_ok" and cnt(r, "SELECT COUNT(*) n FROM challenges") == 0, "E1 check (dry run) leaves no challenge rows")
+
+# 21 E1: resolve keeps provenance note, records events, repeated resolve keeps all history
+import argparse
+r, k, (e1, e2, e3), at = e1_run("e1res")
+chal(r, k, at, "weakened", [e3], note="n"); ingest.recompute_claims(r)
+x = r.one("SELECT id, note FROM contradictions")
+prov = x["note"]
+ns = argparse.Namespace(run=str(r.root), id=x["id"], status="disclosed", note="첫 사유")
+from rlab_core import cli  # noqa: E402
+check(cli.cmd_resolve(ns) == 0, "E1 resolve single-item CLI returns 0")
+r = core.Run(r.root)
+row = r.one("SELECT status s, note n FROM contradictions WHERE id=?", (x["id"],))
+evs = [json.loads(e["d"]) for e in r.q("SELECT detail d FROM events WHERE kind='contradiction_resolved' ORDER BY id")]
+check(row["s"] == "disclosed" and row["n"] == prov, "E1 resolve updates status only, provenance note kept")
+check(len(evs) == 1 and evs[0]["resolution_note"] == "첫 사유" and evs[0]["provenance_note"] == prov and evs[0]["old_status"] == "open" and evs[0]["new_status"] == "disclosed"
+      and evs[0]["contradiction_id"] == x["id"] and evs[0]["claim_id"] == k and evs[0]["evidence_id"] == e3, "E1 resolve event carries ids, statuses, both notes")
+check(r.one("SELECT status s FROM claims")["s"] != "contested", "E1 resolve recomputes claim status")
+cli.cmd_resolve(argparse.Namespace(run=str(r.root), id=x["id"], status="resolved", note="둘째 사유"))
+r = core.Run(r.root)
+evs = [json.loads(e["d"]) for e in r.q("SELECT detail d FROM events WHERE kind='contradiction_resolved' ORDER BY id")]
+check(len(evs) == 2 and evs[0]["resolution_note"] == "첫 사유" and evs[1]["resolution_note"] == "둘째 사유" and evs[1]["old_status"] == "disclosed"
+      and r.one("SELECT note n FROM contradictions WHERE id=?", (x["id"],))["n"] == prov, "E1 repeated resolve appends event; earlier history and provenance kept")
+try:
+    cli.cmd_resolve(argparse.Namespace(run=str(r.root), id="X9999", status="resolved", note="n")); unk = False
+except core.RlabError:
+    unk = True
+check(unk and len(r.q("SELECT 1 FROM events WHERE kind='contradiction_resolved'")) == 2, "E1 unknown contradiction id dies without event")
+cli.cmd_resolve(argparse.Namespace(run=str(r.root), id=x["id"], status="resolved", note=None))
+r = core.Run(r.root)
+check(r.one("SELECT note n FROM contradictions WHERE id=?", (x["id"],))["n"] == prov, "E1 resolve without note keeps provenance")
+
 shutil.rmtree(BASE, ignore_errors=True)
 print("UNIT PASS" if all(RESULTS) else f"UNIT FAIL ({RESULTS.count(False)} of {len(RESULTS)})")
 sys.exit(0 if all(RESULTS) else 1)

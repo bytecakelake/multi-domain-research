@@ -705,6 +705,8 @@ def report_md(run: Run) -> str:
         lim.append(f"- waiver: {r['gate']} ({r['block'] or 'all'}): {r['reason']}")
     for r in run.q("SELECT id, claim_id, status, note FROM contradictions WHERE status!='resolved'"):
         lim.append(f"- contradiction {r['id']} on {r['claim_id']} [{r['status']}]")
+    for r in run.q("SELECT id, claim_id FROM challenges WHERE verdict='inconclusive'"):
+        lim.append(f"- inconclusive challenge {r['id']} on {r['claim_id']} (반증 시도가 결론 없음 — 불확정)")
     for r in run.q("SELECT status, COUNT(*) n FROM claims WHERE status IN ('unsupported','weak','contested') GROUP BY 1"):
         lim.append(f"- claims {r['status']}: {r['n']}")
     for q in run.questions(top_only=True):
