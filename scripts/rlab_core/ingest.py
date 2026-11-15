@@ -395,10 +395,15 @@ def add_challenge(run: Run, row: dict, tid: str, ctx: dict):
     chid = run.nid("C")
     run.db.execute("INSERT INTO challenges(id,task_id,claim_id,expected_falsifier,search_log,found,verdict,note) VALUES(?,?,?,?,?,?,?,?)",
                    (chid, tid, cid, ef, log, 1 if found else 0, verdict, _s(row, "note")))
-    for e in ev or []:
-        run.db.execute("INSERT OR IGNORE INTO claim_evidence VALUES(?,?,?)", (cid, e, "refutes"))
-        x = run.nid("X")
-        run.db.execute("INSERT INTO contradictions(id,claim_id,evidence_id,status,note) VALUES(?,?,?,?,?)", (x, cid, e, "open", f"from challenge {chid} ({verdict})"))
+    if verdict in ("weakened", "refuted"):
+        for e in ev or []:
+            run.db.execute("INSERT OR IGNORE INTO claim_evidence VALUES(?,?,?)", (cid, e, "refutes"))
+            x = run.nid("X")
+            run.db.execute("INSERT INTO contradictions(id,claim_id,evidence_id,status,note) VALUES(?,?,?,?,?)", (x, cid, e, "open", f"from challenge {chid} ({verdict})"))
+    elif ev:  # stands/inconclusive: keep the referenced evidence as context only (no refutes link, no contradiction)
+        ctxline = "[rlab challenge-context v1] " + json.dumps({"evidence_ids": ev}, ensure_ascii=False)
+        orig = _s(row, "note")
+        run.db.execute("UPDATE challenges SET note=? WHERE id=?", (f"{orig}\n{ctxline}" if orig else ctxline, chid))
     return "ok", chid
 
 

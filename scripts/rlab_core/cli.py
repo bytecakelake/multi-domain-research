@@ -315,11 +315,19 @@ def cmd_resolve(a):
     run = _run(a)
     if a.status not in ("resolved", "disclosed"):
         die("--status must be resolved|disclosed")
-    n = run.db.execute("UPDATE contradictions SET status=?, note=COALESCE(?,note) WHERE id=?", (a.status, a.note, a.id)).rowcount
-    if not n:
-        die(f"unknown contradiction: {a.id}")
-    ingest.recompute_claims(run)
-    run.bump()
+    run.db.execute("BEGIN")
+    try:
+        x = run.one("SELECT * FROM contradictions WHERE id=?", (a.id,))
+        if not x:
+            die(f"unknown contradiction: {a.id}")
+        run.db.execute("UPDATE contradictions SET status=? WHERE id=?", (a.status, a.id))  # provenance note is never overwritten
+        run.event("contradiction_resolved", None, contradiction_id=a.id, claim_id=x["claim_id"], evidence_id=x["evidence_id"],
+                  old_status=x["status"], new_status=a.status, resolution_note=a.note, provenance_note=x["note"])
+        ingest.recompute_claims(run)
+        run.db.execute("COMMIT")
+    except BaseException:
+        run.db.execute("ROLLBACK")
+        raise
     print(f"{a.id} -> {a.status}")
     return 0
 

@@ -34,15 +34,6 @@
 
 hard 게이트는 블록 완료를 막고, soft는 재개방 또는 limitations 기록으로 끝납니다. `waive`는 모든 게이트에 대해 가능하지만 항상 `report`의 limitations에 나타납니다. 임계는 workflow `params`이며 `--set`으로 바꿉니다. 기본값은 경험적 출발점이고 많은 run으로 보정된 값이 아닙니다.
 
-## 모순(contradictions) 일괄 해소
+## 모순(contradictions) 해소
 
-adversary wave가 끝나면 **verdict가 `stands`(반증 실패)인 challenge도** claim마다 `contradictions` 행을 만듭니다 — "그 주장에 반증을 시도한 이력이 있다"는 사실 자체가 공개 대상이기 때문이며, weakened/inconclusive만 모순이 아닙니다. 그래서 반증 8건 중 7건이 `stands`로 끝나도 수십 건의 `open` contradiction이 한꺼번에 쌓일 수 있습니다. 하나씩 사유를 다시 쓰지 말고, `challenges.verdict`로 일괄 분류해 해소하십시오:
-
-```python
-import duckdb
-con = duckdb.connect('<run>/ledger.sqlite', read_only=True)
-verdicts = dict(con.execute("SELECT claim_id, verdict FROM challenges").fetchall())
-conts = con.execute("SELECT id, claim_id FROM contradictions WHERE status='open'").fetchall()
-# stands -> resolved(반증 자료를 못 찾아 주장 유지), weakened/inconclusive -> disclosed(약화·불확정, deliverable에 공개)
-```
-이렇게 만든 `(id, status, reason)` 목록을 `rlab resolve --id X.... --status resolved|disclosed --note "..."`로 터미널 배치 호출하십시오(호출이 많으면 위 '단발 CLI 호출' 타임아웃 주의사항을 따라 여러 번에 나눠 돌리고 `gate contradictions`로 남은 건수를 확인합니다).
+challenge verdict가 `weakened`/`refuted`일 때만 `refutes` 링크와 open contradiction이 생깁니다. `stands`/`inconclusive`는 모순을 만들지 않으며, 참조한 evidence id는 challenge note 끝의 `[rlab challenge-context v1] {"evidence_ids": [...]}` 줄에 보존되고 `inconclusive`는 limitations에 나타납니다. 따라서 verdict별 일괄 분류(claim_id→verdict 사전)는 쓰지 마십시오(claim당 challenge가 여러 건이면 덮어씁니다). open 모순은 `rlab resolve --id X.... --status resolved|disclosed --note "..."`로 하나씩 해소하며, 원래 provenance note는 유지되고 사유는 `contradiction_resolved` 이벤트로 기록됩니다.
