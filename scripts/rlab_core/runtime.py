@@ -593,12 +593,17 @@ def retry_task(run: Run, tid: str, option=None, note=None) -> None:
         die(f"unknown task: {tid}")
     if t["status"] == "verified":
         die("verified tasks cannot be retried")
+    note = (note or "").strip()
+    auto = not note
+    if auto:  # never invent a cause: only restate what the ledger already recorded
+        prior = (t["notes"] or "").strip()
+        note = f"auto: retried after status={t['status']}, attempt {t['attempts']}; " + (f"prior note: {prior}" if prior else "no prior note recorded")
     run.db.execute("UPDATE tasks SET status='planned', attempts=attempts+1, notes=?, option=COALESCE(?,option), receipt=?, begun=NULL WHERE id=?",
                    (note, option, _receipt(run, tid, t["input_sha"], t["attempts"] + 1), tid))
     out = run.p("staging", "out", f"{tid}.jsonl")
     if out.exists():
         out.rename(out.with_suffix(f".attempt{t['attempts']}.jsonl"))
-    run.event("retry", tid, note=note, option=option)
+    run.event("retry", tid, note=note, option=option, auto=auto)
 
 
 # ---------------------------------------------------------------- status / report / retro
