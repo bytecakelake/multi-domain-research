@@ -47,7 +47,7 @@ $RLAB next --run R --dispatch --available "A,B,..."        # 엔진 전진 + del
 $RLAB load --run R --task T --file <staging/out/T.jsonl>  # 검증+적재(트랜잭션)   [자식용: begin / check]
 $RLAB gate --run R [name] | status | report | waive --gate G --reason ".." | reopen --block B
 $RLAB sql --run R --recipe coverage | "SELECT ..." [--hash]     # DuckDB 읽기 전용 SQL, recipes: `$RLAB recipes`
-$RLAB source add|set|drop ... | retry --task T | resolve --id X0001 --status resolved|disclosed
+$RLAB source add|set|drop ... | retry --task T | resolve --id X0001 --status resolved|disclosed (여러 건: resolve --file F.jsonl)
 $RLAB done --run R --block B        # PARENT ACTIONS(부모가 직접 수행한 블록, 예: access-broker)를 완료로 표시해 다음 블록 잠금을 풉니다
 $RLAB retro --run R [--score 0-5] --lesson "..."        # 적합도·교훈·변이 제안을 라이브러리에 환류
 ```
