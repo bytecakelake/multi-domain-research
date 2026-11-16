@@ -44,6 +44,8 @@
 
 재시도는 원인 수정 1회 후 재평가가 기본입니다. 같은 구조적 실패가 반복되면 중단하고 계약을 고치거나 승격하십시오.
 
+**자동 분류·동시성·중단(E3)**: `retry`는 사유(`--note`, 없으면 이전 notes)를 패턴으로만 분류해 retry 이벤트에 `failure_class/failure_kind/class_source`로 남기고, 분류가 확실할 때만 notes 앞에 `[env:billing]` 같은 태그를 붙입니다(원문은 변경하지 않음). 분류: `env`(billing=HTTP 402·크레딧 소진, rate_limit=HTTP 429·usage limit, auth=HTTP 401, network=timeout·5xx) / `output`(rejected·proof — 텍스트만으로는 계약 결함인지 모델 한계인지 모름) / `unknown`(태그 없음). `env`는 모델 실패로 세지 않으며 승격 근거가 아닙니다. 사람이 원인을 확정했으면 `retry --cause env|contract|model`이 패턴보다 우선합니다. `next`는 option별 동시 실행(dispatched+returned)을 `params.max_per_option`(기본 3)으로 제한하고, 한도에 걸린 task는 planned로 남아 `capped`(CLI에는 슬롯 대기 목록)로 보고됩니다(option이 없는 task는 제한 없음, `max_parallel`은 별도로 유지). 같은 (block, wave)의 미검증 task가 2개 이상이고 모두 마지막 retry가 같은 option의 `env/billing`이면 meta `halt`가 설정되어 `next`가 dispatch를 내지 않고 `[HALT]`를 출력합니다(단일 task·429·401은 중단하지 않음). 사용자가 충전 또는 다른 provider를 선택한 뒤 `rlab resume --reason "..."`로 해제합니다(`resume` 이벤트 기록, 활성 halt가 없으면 오류).
+
 ## 보안 한계 (정직한 범위)
 
 - receipt는 **실행 없이 지어낸 출력**을 걸러내는 장치입니다. 같은 파일시스템을 쓰는 악의적 자식이 `ledger.sqlite`에서 run_key를 읽으면 위조할 수 있습니다. 즉 사고 방지용이지 적대적 통제가 아닙니다. 인용·SQL 검증은 위조 여부와 무관하게 독립적으로 동작합니다.
