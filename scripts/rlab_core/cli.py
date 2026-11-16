@@ -353,7 +353,7 @@ def cmd_downgrade(a):
         die(f"unknown claim {a.claim}")
     if order[a.strength] >= order.get(c["strength"], 0):
         die(f"{a.claim} is '{c['strength']}'; downgrade only lowers strength (use a new analyst wave to raise it with evidence)")
-    scope = ((c["scope"] or "") + f" [강도 하향 {c['strength']}→{a.strength}: {a.reason}]").strip()
+    scope = ((c["scope"] or "") + f" [strength downgraded {c['strength']}→{a.strength}: {a.reason}]").strip()
     run.db.execute("UPDATE claims SET strength=?, scope=? WHERE id=?", (a.strength, scope, a.claim))
     run.event("downgrade", None, claim=a.claim, old=c["strength"], new=a.strength, reason=a.reason)
     ingest.recompute_claims(run)

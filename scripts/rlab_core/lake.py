@@ -22,34 +22,34 @@ VIEWS = {
 }
 
 RECIPES = {
-    "coverage": ("질문별 근거 수·독립 원천 수·최고 tier",
+    "coverage": ("Evidence count, independent origin count, and best tier per question",
                  "SELECT q.id, q.kind, count(DISTINCT e.id) AS n_evidence, count(DISTINCT s.origin_group) AS n_groups, min(s.tier) AS best_tier "
                  "FROM questions q LEFT JOIN evidence e ON e.question_id=q.id AND e.is_null=0 LEFT JOIN sources s ON s.id=e.source_id "
                  "GROUP BY q.id, q.kind ORDER BY q.id"),
-    "source_mix": ("출처 풀의 lane·tier·stance 분포",
+    "source_mix": ("Distribution of lane/tier/stance in the source pool",
                    "SELECT lane, tier, stance, count(*) AS n FROM sources WHERE status='active' GROUP BY ALL ORDER BY n DESC"),
-    "origin_share": ("origin_group별 근거 점유율(단일 원천 지배 감지)",
+    "origin_share": ("Evidence share per origin_group (detects single-origin dominance)",
                      "SELECT s.origin_group, count(*) AS n_evidence, round(100.0*count(*)/sum(count(*)) OVER (),1) AS pct "
                      "FROM evidence e JOIN sources s ON s.id=e.source_id WHERE e.is_null=0 GROUP BY 1 ORDER BY n_evidence DESC"),
-    "saturation": ("출처 순서별 신규 코드 수(포화 곡선)",
+    "saturation": ("New codes per source order (saturation curve)",
                    "WITH ev AS (SELECT s.seq, e.question_id q, e.label, coalesce(e.entity,'') ent FROM evidence e JOIN sources s ON s.id=e.source_id WHERE e.is_null=0), "
                    "first_seen AS (SELECT q, label, ent, min(seq) AS first_seq FROM ev GROUP BY ALL) "
                    "SELECT s.seq, s.id, count(f.q) AS new_codes, sum(count(f.q)) OVER (ORDER BY s.seq) AS cumulative "
                    "FROM sources s LEFT JOIN first_seen f ON f.first_seq=s.seq WHERE s.kind!='dataset' GROUP BY s.seq, s.id ORDER BY s.seq"),
-    "agreement": ("이중 코딩 단위별 A/B 라벨 일치",
+    "agreement": ("A/B label agreement per double-coded unit",
                   "WITH u AS (SELECT source_id, question_id, coder, mode(label) AS label FROM evidence WHERE coder IN ('A','B') GROUP BY ALL) "
                   "SELECT a.source_id, a.question_id, a.label AS label_A, b.label AS label_B, (a.label=b.label) AS agree "
                   "FROM u a JOIN u b ON a.source_id=b.source_id AND a.question_id=b.question_id AND a.coder='A' AND b.coder='B' ORDER BY 1,2"),
-    "claims": ("주장 상태·강도·유형 분포", "SELECT status, strength, ctype, count(*) AS n FROM claims GROUP BY ALL ORDER BY status, strength"),
-    "entity_matrix": ("대상×속성 수치 행렬(value_num 평균)",
+    "claims": ("Distribution of claim status/strength/type", "SELECT status, strength, ctype, count(*) AS n FROM claims GROUP BY ALL ORDER BY status, strength"),
+    "entity_matrix": ("Entity x attribute numeric matrix (mean of value_num)",
                       "PIVOT (SELECT entity, attribute, round(avg(value_num),4) AS v FROM evidence WHERE value_num IS NOT NULL AND entity IS NOT NULL "
                       "AND attribute IS NOT NULL GROUP BY ALL) ON attribute USING first(v) ORDER BY entity"),
-    "timeline": ("날짜가 있는 근거의 시간순",
+    "timeline": ("Dated evidence in chronological order",
                  "SELECT coalesce(e.as_of, s.as_of) AS d, e.entity, e.attribute, e.value, s.id AS source, e.id AS evidence "
                  "FROM evidence e JOIN sources s ON s.id=e.source_id WHERE coalesce(e.as_of, s.as_of) IS NOT NULL ORDER BY d"),
-    "contradictions": ("미해결 모순", "SELECT x.id, x.claim_id, x.evidence_id, x.status, c.text FROM contradictions x JOIN claims c ON c.id=x.claim_id WHERE x.status='open'"),
-    "tasks": ("블록별 task 상태", "SELECT block, status, count(*) AS n, sum(rows_ok) AS rows_ok, sum(rows_rejected) AS rejected FROM tasks GROUP BY ALL ORDER BY block"),
-    "rejects": ("거부 사유 통계", "SELECT kind, reason, count(*) AS n FROM rejects GROUP BY ALL ORDER BY n DESC"),
+    "contradictions": ("Unresolved contradictions", "SELECT x.id, x.claim_id, x.evidence_id, x.status, c.text FROM contradictions x JOIN claims c ON c.id=x.claim_id WHERE x.status='open'"),
+    "tasks": ("Task status per block", "SELECT block, status, count(*) AS n, sum(rows_ok) AS rows_ok, sum(rows_rejected) AS rejected FROM tasks GROUP BY ALL ORDER BY block"),
+    "rejects": ("Reject reason statistics", "SELECT kind, reason, count(*) AS n FROM rejects GROUP BY ALL ORDER BY n DESC"),
 }
 
 
