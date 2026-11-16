@@ -22,6 +22,8 @@
 
 `next`가 task마다 `tasks/<T>/contract.md`와 `tasks/<T>/input/*`를 생성합니다. 계약서는 자급적입니다: 목표, brief 요약, 질문 트리, 입력(절대경로+sha), 방법 지침, 출력 파일 하나, 행 스키마와 예시, 필수 절차(begin → 작성 → check), 금지 항목. `delegate_task`로는 **포인터만** 보냅니다(부모 토큰 절약; 자식은 같은 파일시스템에서 계약서를 읽습니다). 자식이 파일을 읽지 못하는 환경이면 `next --full`로 전문을 페이로드에 넣으십시오.
 
+**디스패치 상태와 ASCII 페이로드(E2)**: `next --dispatch`는 task를 `ready`(페이로드에 실렸을 뿐 위임 미확인)로 바꾸고 `dispatch_emitted` 이벤트와 `staging/dispatch_NNN.json`을 남깁니다(`tasks.dispatched`는 비워 둡니다). `ready` task는 다시 내보내지 않고 `next`가 `[EMITTED, NOT CONFIRMED]`로 나열하며, `max_parallel`·`max_per_option` 계산에는 진행 중으로 셉니다. `delegate_task`를 실제로 호출한 뒤 `rlab dispatched --payload dispatch_NNN.json`(또는 `--task T` 반복)으로 `ready → dispatched`를 확정합니다(자식의 `begin`도 확정합니다; 이미 dispatched/returned는 조용히 통과, 다른 상태가 하나라도 있으면 전체 거부). 위임하지 않기로 했다면 `rlab unready --payload ...`(또는 `--task`)로 `ready → planned`로 되돌립니다(attempts·receipt 불변, `dispatch_cancelled` 이벤트; `retry`는 위임했는데 실패한 시도에 씁니다: `ready` 상태에서 `retry`하면 위임된 것으로 기록되므로 위임 시점의 402처럼 자식이 `begin`하지 못한 실패도 결제 중단 판정에 포함됩니다). 페이로드의 `goal`/`context`는 task id·블록·역할·`contract.md` 절대경로만 담은 **ASCII 고정 문장**이므로 손으로 다시 쓰지 말고 `next`가 출력한 JSON을 그대로 전달하십시오(한글 목적·목표는 `contract.md`와 페이로드 `meta`에만 있고 `meta`는 `delegate_task`로 보내지 않습니다). 전문이 필요하면 `next --full`. run id와 `RLAB_HOME` 경로가 ASCII여야 이 보장이 성립하며, 아니면 `next`가 stderr에 경고합니다. `--dispatch` 없는 `next`는 `dispatch_dryrun.json`에만 씁니다.
+
 ## 수신증(receipt)과 기계 검증
 
 1. 자식이 `begin --task T` 실행 → `receipt = sha256(run_key | task | input_sha)[:12]`(run_key는 원장에만 있어 추측 불가).
@@ -44,7 +46,7 @@
 
 재시도는 원인 수정 1회 후 재평가가 기본입니다. 같은 구조적 실패가 반복되면 중단하고 계약을 고치거나 승격하십시오.
 
-**자동 분류·동시성·중단(E3)**: `retry`는 사유(`--note`, 없으면 이전 notes)를 패턴으로만 분류해 retry 이벤트에 `failure_class/failure_kind/class_source`로 남기고, 분류가 확실할 때만 notes 앞에 `[env:billing]` 같은 태그를 붙입니다(원문은 변경하지 않음). 분류: `env`(billing=HTTP 402·크레딧 소진, rate_limit=HTTP 429·usage limit, auth=HTTP 401, network=timeout·5xx) / `output`(rejected·proof — 텍스트만으로는 계약 결함인지 모델 한계인지 모름) / `unknown`(태그 없음). `env`는 모델 실패로 세지 않으며 승격 근거가 아닙니다. 사람이 원인을 확정했으면 `retry --cause env|contract|model`이 패턴보다 우선합니다. `next`는 option별 동시 실행(dispatched+returned)을 `params.max_per_option`(기본 3)으로 제한하고, 한도에 걸린 task는 planned로 남아 `capped`(CLI에는 슬롯 대기 목록)로 보고됩니다(option이 없는 task는 제한 없음, `max_parallel`은 별도로 유지). 같은 (block, wave)의 미검증 task가 2개 이상이고 모두 마지막 retry가 같은 option의 `env/billing`이면 meta `halt`가 설정되어 `next`가 dispatch를 내지 않고 `[HALT]`를 출력합니다(단일 task·429·401은 중단하지 않음). 사용자가 충전 또는 다른 provider를 선택한 뒤 `rlab resume --reason "..."`로 해제합니다(`resume` 이벤트 기록, 활성 halt가 없으면 오류).
+**자동 분류·동시성·중단(E3)**: `retry`는 사유(`--note`, 없으면 이전 notes)를 패턴으로만 분류해 retry 이벤트에 `failure_class/failure_kind/class_source`로 남기고, 분류가 확실할 때만 notes 앞에 `[env:billing]` 같은 태그를 붙입니다(원문은 변경하지 않음). 분류: `env`(billing=HTTP 402·크레딧 소진, rate_limit=HTTP 429·usage limit, auth=HTTP 401, network=timeout·5xx) / `output`(rejected·proof — 텍스트만으로는 계약 결함인지 모델 한계인지 모름) / `unknown`(태그 없음). `env`는 모델 실패로 세지 않으며 승격 근거가 아닙니다. 사람이 원인을 확정했으면 `retry --cause env|contract|model`이 패턴보다 우선합니다. `next`는 option별 동시 실행(ready+dispatched+returned)을 `params.max_per_option`(기본 3)으로 제한하고, 한도에 걸린 task는 planned로 남아 `capped`(CLI에는 슬롯 대기 목록)로 보고됩니다(option이 없는 task는 제한 없음, `max_parallel`은 별도로 유지). 같은 (block, wave)의 미검증 task가 2개 이상이고 모두 마지막 retry가 같은 option의 `env/billing`이면 meta `halt`가 설정되어 `next`가 dispatch를 내지 않고 `[HALT]`를 출력합니다(단일 task·429·401은 중단하지 않음). 사용자가 충전 또는 다른 provider를 선택한 뒤 `rlab resume --reason "..."`로 해제합니다(`resume` 이벤트 기록, 활성 halt가 없으면 오류).
 
 ## 보안 한계 (정직한 범위)
 

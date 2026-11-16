@@ -524,7 +524,7 @@ check(res["capped"] == [{"task_id": x, "option": "M-Terra-Quick", "cap": 3} for 
 check(set(e3_state(r).values()) == {"planned"}, "cap: dry run dispatches nothing")
 res = runtime.next_actions(r, dispatch=True)
 st = e3_state(r)
-check([st[x] for x in ts] == ["dispatched"] * 3 + ["planned"] * 2, "cap: dispatch marks only the 3 uncapped tasks")
+check([st[x] for x in ts] == ["ready"] * 3 + ["planned"] * 2, "cap: dispatch marks only the 3 uncapped tasks ready")
 res = runtime.next_actions(r)
 check(res["dispatch"] == [] and [c["task_id"] for c in res["capped"]] == ts[3:], "cap: in-flight tasks count toward the option cap")
 r.db.execute("UPDATE tasks SET status='returned' WHERE id=?", (ts[0],))
@@ -651,12 +651,241 @@ for _ in range(4): task(r, "scout", None)
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     res = runtime.next_actions(r)
-    for p in res["dispatch"]: p["pointer"] = "ptr"
     cli._print_next(res, False)
 check("wait" in buf.getvalue().lower() and "M-Terra-Quick" in buf.getvalue() and "3" in buf.getvalue(), "CLI prints which tasks wait for a free option slot")
 import subprocess as _sp
 helptxt = _sp.run([sys.executable, str(Path(__file__).resolve().parent / "rlab.py"), "retry", "--help"], capture_output=True, text=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}).stdout
 check("--cause" in helptxt and "env,contract,model" in helptxt.replace("{", "").replace("}", "").replace(" ", ""), "retry --cause offers env|contract|model choices")
+
+# 28 E2: 'ready' (emitted in a payload) is separate from 'dispatched' (delegation confirmed); payload is ASCII-only
+def e2_run(case, n=3, ids=("scout",), params=None):
+    r = setup(case, list(ids), {"max_parallel": 10, **(params or {})})
+    return r, [task(r, ids[0], None) for _ in range(n)]
+def e2_row(r, t):
+    return r.one("SELECT * FROM tasks WHERE id=?", (t,))
+def e2_ev(r, kind, t=None):
+    return [json.loads(x["d"] or "{}") | {"task": x["task_id"]} for x in r.q("SELECT task_id, detail d FROM events WHERE kind=? ORDER BY id", (kind,)) if t is None or x["task_id"] == t]
+def e2_ns(r, **kw):
+    return argparse.Namespace(run=str(r.root), payload=kw.pop("payload", None), task=kw.pop("task", None), **kw)
+def e2_dies(fn, *a, **kw):
+    try:
+        fn(*a, **kw)
+    except core.RlabError as ex:
+        return str(ex)
+    return None
+def e2_out(fn, *a):
+    ob, eb = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(ob), contextlib.redirect_stderr(eb):
+        rc = fn(*a)
+    return rc, ob.getvalue(), eb.getvalue()
+def e2_next(r, **kw):
+    ns = argparse.Namespace(run=str(r.root), max=None, dispatch=True, available=None, json=True, full=False)
+    for k, v in kw.items(): setattr(ns, k, v)
+    return e2_out(cli.cmd_next, ns)
+def e2_case(fn):
+    try:
+        fn()
+    except Exception as ex:  # a missing feature must show up as a failed case, not abort the file
+        check(False, f"{fn.__name__} raised {type(ex).__name__}: {ex}")
+
+def e2_emit():
+    r, ts = e2_run("e2emit")
+    res = runtime.next_actions(r, dispatch=True)
+    pf = Path(res["payload_path"]).name
+    rows = [e2_row(r, t) for t in ts]
+    check([x["status"] for x in rows] == ["ready"] * 3 and all(x["dispatched"] is None for x in rows), "E2: next --dispatch leaves tasks 'ready' with tasks.dispatched NULL")
+    check(all(x["option"] == "M-Terra-Quick" for x in rows), "E2: emit still records the picked option")
+    em = e2_ev(r, "dispatch_emitted")
+    check([e["task"] for e in em] == ts and all(e["option"] == "M-Terra-Quick" and e["payload"] == pf for e in em), "E2: event dispatch_emitted records task, option and payload file name")
+    check(e2_ev(r, "dispatch") == [], "E2: emit records no 'dispatch' event")
+    res2 = runtime.next_actions(r, dispatch=True)
+    check(res2["dispatch"] == [] and res2["payload_path"] is None and [e["task_id"] for e in res2["emitted"]] == ts and all(e["payload"] == pf for e in res2["emitted"]), "E2: a second next does not re-emit ready tasks and lists them as emitted")
+    check(len(e2_ev(r, "dispatch_emitted")) == 3 and [e2_row(r, t)["status"] for t in ts] == ["ready"] * 3 and res2["inflight"] == [], "E2: second next changes nothing; ready tasks are not in the in-flight list")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli._print_next(res2, False)
+    out = buf.getvalue()
+    check("[EMITTED, NOT CONFIRMED]" in out and all(t in out for t in ts) and pf in out and "rlab dispatched --payload" in out and "rlab unready --payload" in out, "E2: next prints [EMITTED, NOT CONFIRMED] with task, option, payload file and both ways out")
+    r2, ts2 = e2_run("e2emit2", 2)
+    res = runtime.next_actions(r2, dispatch=True)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli._print_next(res, False)
+    out = buf.getvalue()
+    check("delegate_task" in out and "rlab dispatched --payload" in out and "rlab unready --payload" in out and "begin" in out, "E2: after [DISPATCH] next tells the parent to delegate, then run dispatched (or rely on begin), else unready")
+    r3, ts3 = e2_run("e2dry", 2)
+    res = runtime.next_actions(r3)
+    check([e2_row(r3, t)["status"] for t in ts3] == ["planned"] * 2 and Path(res["payload_path"]).name == "dispatch_dryrun.json", "E2: a dry run marks nothing and writes a separate preview file")
+    res = runtime.next_actions(r3, dispatch=True)
+    pf3 = Path(res["payload_path"])
+    before = pf3.read_bytes()
+    runtime.next_actions(r3)
+    check(pf3.read_bytes() == before and pf3.name == "dispatch_001.json", "E2: a later dry run never overwrites an emitted payload file")
+e2_case(e2_emit)
+
+def e2_capacity():
+    r, ts = e2_run("e2par", 5, params={"max_parallel": 2, "max_per_option": 10})
+    runtime.next_actions(r, dispatch=True)
+    res = runtime.next_actions(r, dispatch=True)
+    check(res["dispatch"] == [] and res["queued"] == 3 and [e2_row(r, t)["status"] for t in ts] == ["ready"] * 2 + ["planned"] * 3, "E2: ready tasks count toward max_parallel")
+    r, ts = e2_run("e2cap", 5)
+    runtime.next_actions(r, dispatch=True)
+    res = runtime.next_actions(r, dispatch=True)
+    check(res["dispatch"] == [] and [c["task_id"] for c in res["capped"]] == ts[3:] and [e2_row(r, t)["status"] for t in ts] == ["ready"] * 3 + ["planned"] * 2, "E2: ready tasks count toward the per-option cap")
+e2_case(e2_capacity)
+
+def e2_dispatched_cmd():
+    r, ts = e2_run("e2dsp", 3, params={"max_parallel": 2})
+    res = runtime.next_actions(r, dispatch=True)
+    pf = Path(res["payload_path"])
+    rc, out, _ = e2_out(cli.cmd_dispatched, e2_ns(r, payload=pf.name))
+    rows = [e2_row(r, t) for t in ts]
+    check(rc == 0 and [x["status"] for x in rows] == ["dispatched", "dispatched", "planned"] and rows[0]["dispatched"] and rows[1]["dispatched"] and rows[2]["dispatched"] is None, "E2: dispatched --payload <bare name> promotes ready -> dispatched and sets tasks.dispatched")
+    check(all(x["option"] == "M-Terra-Quick" for x in rows[:2]) and [e["option"] for e in e2_ev(r, "dispatch")] == ["M-Terra-Quick"] * 2 and [e["task"] for e in e2_ev(r, "dispatch")] == ts[:2], "E2: dispatched keeps the option and records a 'dispatch' event per task")
+    r.db.execute("UPDATE tasks SET dispatched='2026-01-01T00:00:00Z' WHERE id=?", (ts[0],))
+    r.db.execute("UPDATE tasks SET status='returned' WHERE id=?", (ts[1],))
+    n_ev = len(e2_ev(r, "dispatch"))
+    rc, _, _ = e2_out(cli.cmd_dispatched, e2_ns(r, payload=str(pf)))
+    check(rc == 0 and e2_row(r, ts[0])["dispatched"] == "2026-01-01T00:00:00Z" and e2_row(r, ts[1])["status"] == "returned" and len(e2_ev(r, "dispatch")) == n_ev, "E2: dispatched is idempotent for already dispatched / returned tasks (full path accepted)")
+    r, ts = e2_run("e2dsp2", 3, params={"max_parallel": 2})
+    pf = Path(runtime.next_actions(r, dispatch=True)["payload_path"])
+    snap = lambda: ([dict(x) for x in r.q("SELECT * FROM tasks ORDER BY id")], r.one("SELECT COUNT(*) n FROM events")["n"])
+    s0 = snap()
+    msg = e2_dies(cli.cmd_dispatched, e2_ns(r, task=[ts[0], ts[2]]))
+    check(msg and ts[2] in msg and "planned" in msg and snap() == s0, "E2: dispatched with a planned offender dies listing it and changes nothing")
+    r.db.execute("UPDATE tasks SET status='verified' WHERE id=?", (ts[1],))
+    s0 = snap()
+    msg = e2_dies(cli.cmd_dispatched, e2_ns(r, payload=str(pf)))
+    check(msg and ts[1] in msg and "verified" in msg and snap() == s0 and e2_row(r, ts[0])["status"] == "ready", "E2: dispatched --payload with a verified offender is all-or-nothing")
+    msg = e2_dies(cli.cmd_dispatched, e2_ns(r, task=["T9999"]))
+    check(msg and "T9999" in msg, "E2: dispatched with an unknown task dies")
+    check(e2_dies(cli.cmd_dispatched, e2_ns(r, payload=str(pf), task=[ts[0]])) and e2_dies(cli.cmd_dispatched, e2_ns(r)) and e2_row(r, ts[0])["status"] == "ready", "E2: --payload and --task are mutually exclusive and one is required")
+    msg = e2_dies(cli.cmd_dispatched, e2_ns(r, payload="dispatch_999.json"))
+    check(msg and "dispatch_999.json" in msg, "E2: a missing payload dies clearly")
+    bad = r.p("staging", "dispatch_bad.json"); bad.write_text("{not json")
+    check(e2_dies(cli.cmd_dispatched, e2_ns(r, payload=bad.name)) and e2_dies(cli.cmd_unready, e2_ns(r, payload="dispatch_999.json")), "E2: an unreadable payload dies clearly (dispatched and unready)")
+    rc, _, _ = e2_out(cli.cmd_dispatched, e2_ns(r, task=[ts[0]]))
+    check(rc == 0 and e2_row(r, ts[0])["status"] == "dispatched", "E2: dispatched --task T works")
+e2_case(e2_dispatched_cmd)
+
+def e2_begin():
+    r, ts = e2_run("e2begin", 3, params={"max_parallel": 1})
+    runtime.next_actions(r, dispatch=True)
+    r.db.execute("UPDATE tasks SET dispatched='2026-01-01T00:00:00Z' WHERE id=?", (ts[2],))
+    for t in ts: runtime.begin_task(r, t)
+    rows = [e2_row(r, t) for t in ts]
+    check([x["status"] for x in rows] == ["dispatched"] * 3 and all(x["begun"] for x in rows), "E2: begin promotes both a ready and a planned task to dispatched")
+    check(rows[0]["dispatched"] and rows[1]["dispatched"] and rows[2]["dispatched"] == "2026-01-01T00:00:00Z", "E2: begin sets tasks.dispatched (keeps an earlier timestamp)")
+e2_case(e2_begin)
+
+def e2_unready():
+    r, ts = e2_run("e2un", 3)
+    pf = Path(runtime.next_actions(r, dispatch=True)["payload_path"])
+    before = {t: dict(e2_row(r, t)) for t in ts}
+    rc, out, _ = e2_out(cli.cmd_unready, e2_ns(r, task=[ts[0], ts[1]]))
+    rows = {t: dict(e2_row(r, t)) for t in ts}
+    check(rc == 0 and [rows[t]["status"] for t in ts] == ["planned", "planned", "ready"], "E2: unready returns ready -> planned (only the named tasks)")
+    check(all(rows[t]["attempts"] == before[t]["attempts"] == 0 and rows[t]["receipt"] == before[t]["receipt"] and rows[t]["begun"] is None for t in ts[:2]), "E2: unready keeps attempts and the receipt")
+    check([e["task"] for e in e2_ev(r, "dispatch_cancelled")] == ts[:2] and all(e["option"] == "M-Terra-Quick" for e in e2_ev(r, "dispatch_cancelled")), "E2: unready records dispatch_cancelled events")
+    res = runtime.next_actions(r, dispatch=True)
+    check([p["task_id"] for p in res["dispatch"]] == ts[:2] and Path(res["payload_path"]).name == "dispatch_002.json" and [e["task_id"] for e in res["emitted"]] == [ts[2]], "E2: next re-emits the unreadied tasks in a new payload")
+    runtime.confirm_dispatched(r, [ts[0]])
+    s0 = [dict(x) for x in r.q("SELECT * FROM tasks ORDER BY id")]
+    e0 = r.one("SELECT COUNT(*) n FROM events")["n"]
+    msg = e2_dies(cli.cmd_unready, e2_ns(r, task=[ts[2], ts[0]]))
+    check(msg and ts[0] in msg and "dispatched" in msg and [dict(x) for x in r.q("SELECT * FROM tasks ORDER BY id")] == s0 and r.one("SELECT COUNT(*) n FROM events")["n"] == e0, "E2: unready with a non-ready offender dies listing it and changes nothing")
+    msg = e2_dies(cli.cmd_unready, e2_ns(r, payload=str(pf)))
+    check(msg and [dict(x) for x in r.q("SELECT * FROM tasks ORDER BY id")] == s0, "E2: unready --payload is all-or-nothing too")
+    check(e2_dies(cli.cmd_unready, e2_ns(r, payload=str(pf), task=[ts[2]])) and e2_dies(cli.cmd_unready, e2_ns(r)), "E2: unready needs exactly one of --payload / --task")
+    r, ts = e2_run("e2un2", 2)
+    pf = Path(runtime.next_actions(r, dispatch=True)["payload_path"])
+    rc, _, _ = e2_out(cli.cmd_unready, e2_ns(r, payload=pf.name))
+    check(rc == 0 and [e2_row(r, t)["status"] for t in ts] == ["planned"] * 2, "E2: unready --payload <file> returns all payload tasks")
+e2_case(e2_unready)
+
+def e2_retry_load():
+    r, ts = e2_run("e2retry", 2)
+    runtime.next_actions(r, dispatch=True)
+    rcpt = e2_row(r, ts[0])["receipt"]
+    runtime.retry_task(r, ts[0], note="parent decided to retry")
+    x = e2_row(r, ts[0])
+    check(x["status"] == "planned" and x["attempts"] == 1 and x["receipt"] != rcpt, "E2: retry on a ready task still works (planned, attempts+1, receipt rotated)")
+    rp = e2_row(r, ts[1])["receipt"]
+    out = r.p("staging", "out", ts[1] + ".jsonl"); out.write_text(json.dumps({"_meta": {"task": ts[1], "receipt": rp, "n_rows": 0, "empty": True, "blocker": "x"}}))
+    res = ingest.ingest_file(r, ts[1], out, allow_empty=True)
+    y = e2_row(r, ts[1])
+    check(res["status"] == "proof_failed" and "begin" in res["proof"] and y["receipt"] == rp and y["begun"] is None and y["attempts"] == 0, "E2: loading a never-begun ready task is rejected by the begin proof, receipt untouched")
+    r, ts = e2_run("e2load", 2)
+    runtime.next_actions(r, dispatch=True); runtime.begin_task(r, ts[0])
+    out = r.p("staging", "out", ts[0] + ".jsonl"); out.write_text(json.dumps({"_meta": {"task": ts[0], "receipt": e2_row(r, ts[0])["receipt"], "n_rows": 0, "empty": True, "blocker": "x"}}))
+    check(ingest.ingest_file(r, ts[0], out, commit=False, allow_empty=True)["proof"] == "ok", "E2: a ready task that was begun passes the proof")
+    out = r.p("staging", "out", ts[1] + ".jsonl"); out.write_text(json.dumps({"_meta": {"task": ts[1], "receipt": "guessed", "n_rows": 0}}))
+    check(ingest.ingest_file(r, ts[1], out, commit=False)["status"] == "proof_failed" and e2_row(r, ts[1])["status"] == "ready", "E2: a guessed receipt on a ready task is still rejected (dry run leaves it ready)")
+e2_case(e2_retry_load)
+
+def e2_billing():
+    r, ts = e2_run("e2bill", 3)
+    runtime.next_actions(r, dispatch=True)
+    runtime.confirm_dispatched(r, [ts[0]]); runtime.begin_task(r, ts[1])
+    r.db.execute("UPDATE tasks SET status='failed' WHERE id IN (?,?)", (ts[0], ts[1]))
+    runtime.retry_task(r, ts[0], note="HTTP 402"); runtime.retry_task(r, ts[1], note="HTTP 402")
+    check(r.meta("halt") is None, "E2: billing stop waits while an emitted sibling has not reported yet (ready counts as unreported)")
+    runtime.retry_task(r, ts[2], note="HTTP 402")  # still 'ready': a 402 at delegation time never reaches begin
+    h = json.loads(r.meta("halt") or "null")
+    check(h and sorted(h["tasks"]) == sorted(ts), "E2: once the last emitted sibling reports 402 too, the stop covers confirmed and never-confirmed tasks alike")
+e2_case(e2_billing)
+
+def e2_ascii():
+    r, _ = e2_run("e2ascii", 0, ids=("scout", "analyze-claims"))
+    spec = json.loads(r.p("workflow.json").read_text())
+    for b in spec["blocks"]:
+        b["purpose"] = "한국어 목적 설명 " + b["id"]; b["goal"] = "한국어 목표: 반드시 계약서를 따르십시오 " + b["id"]
+    r.p("workflow.json").write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8"); r._spec = None
+    ts = [task(r, "scout", None), task(r, "scout", None), task(r, "analyze-claims", None)]
+    rc, out, err = e2_next(r)
+    res = json.loads(out)
+    pf = json.loads(Path(res["payload_path"]).read_text(encoding="utf-8"))
+    cp = {t: str(r.p("tasks", t, "contract.md")) for t in ts}
+    check(rc == 0 and len(pf["tasks"]) == len(pf["meta"]) == 3 and all(x["goal"].isascii() and x["context"].isascii() for x in pf["tasks"]), "E2: payload file goal and context are ASCII-only although block purposes are Korean")
+    check(all(x["goal"].isascii() and x["context"].isascii() for x in res["dispatch"]) and err == "", "E2: what next hands to the parent is ASCII-only and an ASCII run does not warn")
+    check(all(m["task_id"] in x["goal"] and m["block"] in x["goal"] and m["role"] in x["goal"] and cp[m["task_id"]] in x["goal"] for m, x in zip(pf["meta"], pf["tasks"])), "E2: goal carries task id, block id, role and the contract path")
+    check(all(m["task_id"] in x["context"] and cp[m["task_id"]] in x["context"] and r.meta("run_id") in x["context"] and "begin -> write output -> check" in x["context"] and "no instructions outside the contract" in x["context"] for m, x in zip(pf["meta"], pf["tasks"])), "E2: context is a pointer sentence with run id, task id, contract path and the procedure")
+    check(all(not Path(cp[t]).read_text(encoding="utf-8").isascii() and "한국어 목표" in Path(cp[t]).read_text(encoding="utf-8") for t in ts) and "pointer" not in res["dispatch"][0], "E2: the Korean purpose and goal stay in contract.md")
+    r2, ts2 = e2_run("e2full", 0)
+    spec = json.loads(r2.p("workflow.json").read_text()); spec["blocks"][0]["goal"] = "한국어 목표 전체 계약"
+    r2.p("workflow.json").write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8"); r2._spec = None
+    t2 = task(r2, "scout", None)
+    rc, out, err = e2_next(r2, full=True)
+    res = json.loads(out); pf = json.loads(Path(res["payload_path"]).read_text(encoding="utf-8"))
+    full = r2.p("tasks", t2, "contract.md").read_text(encoding="utf-8")
+    byid = {m["task_id"]: x for m, x in zip(pf["meta"], pf["tasks"])}
+    check(byid[t2]["context"] == full and "한국어 목표 전체 계약" in byid[t2]["context"] and all(x["goal"].isascii() for x in pf["tasks"]) and any(d["context"] == full for d in res["dispatch"]), "E2: --full embeds the full Korean contract as context; goal stays ASCII")
+e2_case(e2_ascii)
+
+def e2_nonascii_path():
+    r, ts = e2_run("한글-런", 1)
+    rc, out, err = e2_next(r)
+    check(rc == 0 and json.loads(out)["dispatch"] and "not ASCII-only" in err, "E2: a non-ASCII run path warns on stderr that the payload is not ASCII-only and does not crash")
+e2_case(e2_nonascii_path)
+
+# 29 E2 x E3: a delegation that fails with 402 never reaches begin, so the task is still 'ready' when the parent retries it
+def e2_billing_run(case, n, per_option):
+    r = setup(case, ["scout", "analyze-claims"], {"max_parallel": 10, "max_per_option": per_option})
+    ts = [task(r, "scout", None) for _ in range(n)]
+    res = runtime.next_actions(r, dispatch=True)
+    return r, ts, [p["task_id"] for p in res["dispatch"]]
+r, ts, sent = e2_billing_run("e2b1", 3, 2)
+waiting = [t for t in ts if t not in sent]
+check(len(sent) == 2 and len(waiting) == 1 and all(r.one("SELECT status s, dispatched d FROM tasks WHERE id=?", (t,))["s"] == "ready" for t in sent), "E2xE3 setup: two tasks emitted (ready), one held back by the cap")
+runtime.retry_task(r, sent[0], note="HTTP 402 payment required")
+check(e3_halt(r) is None, "E2xE3: first 402 retry does not stop while the sibling is still emitted and unreported")
+runtime.retry_task(r, sent[1], note="HTTP 402 payment required")
+h = e3_halt(r)
+check(h is not None and sorted(h["tasks"]) == sorted(sent) and waiting[0] not in h["tasks"], "E2xE3: 402 retries of emitted (never confirmed) tasks stop dispatch; the held-back task is not part of the group")
+check(all(r.one("SELECT dispatched d FROM tasks WHERE id=?", (t,))["d"] for t in sent), "E2xE3: retrying a ready task records that it had been delegated")
+r, ts, sent = e2_billing_run("e2b2", 2, 3)
+runtime.unready_tasks(r, sent)
+check(all(r.one("SELECT status s, dispatched d FROM tasks WHERE id=?", (t,))["s"] == "planned" and r.one("SELECT dispatched d FROM tasks WHERE id=?", (t,))["d"] is None for t in sent), "E2xE3: unready leaves dispatched NULL (never delegated)")
 
 shutil.rmtree(BASE, ignore_errors=True)
 print("UNIT PASS" if all(RESULTS) else f"UNIT FAIL ({RESULTS.count(False)} of {len(RESULTS)})")

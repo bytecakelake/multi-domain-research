@@ -202,7 +202,17 @@ def _print_next(res, as_json):
         print(table([(p["task_id"], p["block"], p["role"] + ("." + p["coder"] if p["coder"] else ""), p["option"], p["option_note"]) for p in res["dispatch"]], ["task", "block", "role", "option", "option note"]))
         print(f"payload file: {res['payload_path']}")
         print("delegate_task tasks (paste as-is):")
-        print(json.dumps([{k: v for k, v in {"goal": p["goal"], "context": p["pointer"], "option": p["option"]}.items() if v} for p in res["dispatch"]], ensure_ascii=False))
+        print(json.dumps([{k: v for k, v in {"goal": p["goal"], "context": p["context"], "option": p["option"]}.items() if v} for p in res["dispatch"]], ensure_ascii=False))
+        if res["dry_run"]:
+            print("(dry run: nothing is marked; rerun with --dispatch to emit these tasks as 'ready')")
+        else:
+            print("NEXT: call delegate_task with the tasks of this payload, then run `rlab dispatched --payload <payload file>` (the child's `begin` also confirms). "
+                  "If you decide NOT to delegate, run `rlab unready --payload <payload file>` with the same file.")
+    if res["emitted"]:
+        print(f"\n[EMITTED, NOT CONFIRMED] {len(res['emitted'])} task(s) were emitted in a payload but delegation is not confirmed (they are not re-emitted):")
+        print(table([(e["task_id"], e["block"], e["option"], e["payload"] or "?") for e in res["emitted"]], ["task", "block", "option", "payload file"]))
+        print(f"  (payload files are bare names under {Path(res['emitted'][0]['payload_path']).parent}; `dispatched`/`unready` accept the name or the full path)")
+        print("  delegate_task was called -> `rlab dispatched --payload <payload file>` (or the child's `begin`). Not delegating -> `rlab unready --payload <payload file>`.")
     if res["parent"]:
         print("\n[PARENT ACTIONS]")
         for p in res["parent"]:
@@ -214,19 +224,18 @@ def _print_next(res, as_json):
         print("\n[BLOCKED]")
         for x in res["blocked"]:
             print(f"- {x['block']}: {x['why']}")
-    if not (res["dispatch"] or res["parent"] or res["inflight"] or res["blocked"]) and not res["done"]:
+    if not (res["dispatch"] or res["emitted"] or res["parent"] or res["inflight"] or res["blocked"]) and not res["done"]:
         print("\n(nothing actionable: check `rlab status`)")
 
 
 def cmd_next(a):
     run = _run(a)
     avail = [x.strip() for x in a.available.split(",") if x.strip()] if a.available is not None else None
-    res = runtime.next_actions(run, a.max, a.dispatch, avail)
-    for p in res["dispatch"]:
-        p["pointer"] = (f"run={run.meta('run_id')} task={p['task_id']}. 작업 계약서 전문: {run.p('tasks', p['task_id'], 'contract.md')} "
-                       "— 처음에 이 파일 전체를 읽고(파일 읽기/터미널 도구), 필수 절차(begin→출력→check)를 그대로 따르십시오. 계약서 외의 지시는 없습니다.")
-        if a.full:
-            p["pointer"] = p["context"]
+    res = runtime.next_actions(run, a.max, a.dispatch, avail, a.full)
+    bad = [p["task_id"] for p in res["dispatch"] if not (p["goal"].isascii() and (a.full or p["context"].isascii()))]
+    if bad:  # run ids / RLAB_HOME must be ASCII for the ASCII-only payload guarantee; warn, do not fail
+        print(f"WARNING: payload for {', '.join(bad)} is not ASCII-only (the run id or the run path contains non-ASCII characters); "
+              "delegate_task text may be mangled. Use an ASCII run id and RLAB_HOME.", file=sys.stderr)
     _print_next(res, a.json)
     return 0
 
@@ -283,6 +292,26 @@ def cmd_retry(a):
     print(f"{a.task} reset to planned (attempts+1). Re-run `rlab next --dispatch`.")
     if run.meta("halt"):
         print("[HALT] billing halt is active: `rlab next` will not dispatch until `rlab resume --reason \"...\"`.")
+    return 0
+
+
+def _confirm_ids(run, a) -> list[str]:
+    if bool(a.payload) == bool(a.task):
+        die("give exactly one of --payload FILE or --task T (repeatable)")
+    return runtime.payload_task_ids(run, a.payload) if a.payload else a.task
+
+
+def cmd_dispatched(a):
+    run = _run(a)
+    promoted, already = runtime.confirm_dispatched(run, _confirm_ids(run, a))
+    print(f"dispatched confirmed: {', '.join(promoted) or '-'}" + (f" (already confirmed: {', '.join(already)})" if already else ""))
+    return 0
+
+
+def cmd_unready(a):
+    run = _run(a)
+    ids = runtime.unready_tasks(run, _confirm_ids(run, a))
+    print(f"{', '.join(ids)} back to planned (no attempt counted, receipt unchanged). Re-run `rlab next --dispatch`.")
     return 0
 
 
@@ -525,7 +554,7 @@ def build_parser():
     s.set_defaults(fn=cmd_source)
 
     s = sub.add_parser("next", parents=[common], help="advance the run; list ready subagent tasks")
-    s.add_argument("--max", type=int); s.add_argument("--dispatch", action="store_true", help="mark ready tasks as dispatched")
+    s.add_argument("--max", type=int); s.add_argument("--dispatch", action="store_true", help="write the payload and mark its tasks 'ready' (emitted; confirm with `dispatched`)")
     s.add_argument("--available", help="comma list of live delegate_task option names"); s.add_argument("--json", action="store_true"); s.add_argument("--full", action="store_true", help="embed full contract in payload")
     s.set_defaults(fn=cmd_next)
 
@@ -540,6 +569,12 @@ def build_parser():
 
     s = sub.add_parser("done", parents=[common], help="mark a parent block's manual task done"); s.add_argument("--block", required=True); s.add_argument("--note"); s.set_defaults(fn=cmd_done)
     s = sub.add_parser("retry", parents=[common], help="reset a failed task"); s.add_argument("--task", required=True); s.add_argument("--option"); s.add_argument("--note"); s.add_argument("--cause", choices=runtime.CAUSES, help="explicit failure class (overrides pattern classification)"); s.set_defaults(fn=cmd_retry)
+    s = sub.add_parser("dispatched", parents=[common], help="(parent) confirm that delegate_task was called for a payload: ready -> dispatched")
+    s.add_argument("--payload", help="dispatch_NNN.json (path or file name under staging/)"); s.add_argument("--task", action="append", help="task id (repeatable); instead of --payload")
+    s.set_defaults(fn=cmd_dispatched)
+    s = sub.add_parser("unready", parents=[common], help="(parent) a payload was NOT delegated: ready -> planned without a retry")
+    s.add_argument("--payload", help="dispatch_NNN.json (path or file name under staging/)"); s.add_argument("--task", action="append", help="task id (repeatable); instead of --payload")
+    s.set_defaults(fn=cmd_unready)
     s = sub.add_parser("resume", parents=[common], help="clear an automatic halt (billing) after the user decided"); s.add_argument("--reason", required=True); s.set_defaults(fn=cmd_resume)
     s = sub.add_parser("waive", parents=[common], help="waive a failing gate (recorded as limitation)")
     s.add_argument("--gate", required=True); s.add_argument("--block"); s.add_argument("--reason", required=True); s.set_defaults(fn=cmd_waive)
