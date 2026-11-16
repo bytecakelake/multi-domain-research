@@ -255,6 +255,12 @@ for rnd in range(60):
             m = re.search(r"gate fail: (\w+)", bl["why"]) if "failed tasks" not in bl["why"] else None
             if m:
                 R("waive", "--run", RUN, "--gate", m.group(1), "--block", bl["block"], "--reason", "selftest waiver")
+    if nxt["dispatch"]:  # emitted tasks are 'ready'; confirm by `dispatched` in even rounds, by the child's begin in odd rounds
+        ids = ",".join(f"'{t['task_id']}'" for t in nxt["dispatch"])
+        check(int(sqlite_one(f"SELECT COUNT(*) FROM tasks WHERE id IN ({ids}) AND status='ready' AND dispatched IS NULL")) == len(nxt["dispatch"]), f"[{rnd}] next --dispatch leaves its tasks ready")
+        if rnd % 2 == 0:
+            R("dispatched", "--run", RUN, "--payload", nxt["payload_path"])
+            check(int(sqlite_one(f"SELECT COUNT(*) FROM tasks WHERE id IN ({ids}) AND status='dispatched' AND dispatched IS NOT NULL")) == len(nxt["dispatch"]), f"[{rnd}] dispatched --payload confirms them")
     for t in nxt["dispatch"]:
         ok, o = fake(t)
         print(f"  [{rnd}] {t['task_id']} {t['block']:<16} -> {'VERIFIED' if ok else 'NOT VERIFIED'}")

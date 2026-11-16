@@ -5,7 +5,7 @@
 ```
 brief.md  workflow.json  ledger.sqlite        # 원장(쓰기 진실), 트랜잭션으로만 변경
 raw/          S0001.txt (정규 텍스트, 불변)  S0001.orig.html ...
-staging/      incoming/<task>/ (수집자 저장)  out/<task>.jsonl (자식 출력)  dispatch_NNN.json
+staging/      incoming/<task>/ (수집자 저장)  out/<task>.jsonl (자식 출력)  dispatch_NNN.json  dispatch_dryrun.json(미리보기)
 tasks/<T>/    contract.md  input/*
 lake/         analysis.duckdb  parquet/<table>.parquet  datasets/<name>.parquet  .rev
 reports/      deliverable.md  status.md  retro.json

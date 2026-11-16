@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import sys
+from collections import Counter
 from pathlib import Path
 
 from . import gates as gates_mod
@@ -15,7 +16,8 @@ from .core import (ASSETS, SKILL_DIR, Run, die, jdump, new_run_db, now, read_jso
 
 QKINDS = {"yesno", "compare", "measure", "trend", "rank", "describe", "explain", "forecast"}
 DATA_QKINDS = {"measure", "compare", "trend", "rank"}
-OPEN = ("planned", "dispatched", "returned")
+# task.status lifecycle: planned -> ready (emitted in a dispatch payload, delegation NOT confirmed) -> dispatched -> returned -> verified|failed|proof_failed
+OPEN = ("planned", "ready", "dispatched", "returned")
 STRENGTH_ORDER = {"strong": 0, "moderate": 1, "weak": 2}
 
 SCHEMA_HINTS = {
@@ -515,17 +517,33 @@ def pick_option(role: str, coder, available):
     return (prefs[0] if prefs else None), "unverified: confirm the name against the live delegate_task options"
 
 
-def next_actions(run: Run, max_dispatch=None, dispatch=False, available=None) -> dict:
+def _goal_text(tid: str, bid: str, role: str, contract: Path) -> str:
+    """Fixed ASCII sentence for delegate_task `goal`; the Korean purpose/goal text lives only in contract.md.
+
+    ASCII-only holds as long as run ids, block ids and the RLAB_HOME path are ASCII (cmd_next warns otherwise).
+    """
+    return (f"Execute research task {tid} (block {bid}, role {role}). Read the full task contract at {contract} "
+            "from start to end and follow its required procedure exactly.")
+
+
+def _pointer_text(run_id: str, tid: str, contract: Path) -> str:
+    """ASCII pointer sentence used as delegate_task `context` unless `next --full` embeds the whole contract."""
+    return (f"run={run_id} task={tid}. The full task contract is the file {contract} . First read that whole file with a file-read or terminal tool, "
+            "then follow its required procedure (begin -> write output -> check) exactly. There are no instructions outside the contract.")
+
+
+def next_actions(run: Run, max_dispatch=None, dispatch=False, available=None, full=False) -> dict:
     notes = advance(run)
     spec_blocks = run.spec["blocks"]
     inflight = [dict(t) for t in run.q("SELECT * FROM tasks WHERE manual=0 AND status IN ('dispatched','returned') ORDER BY id")]
-    slots = (max_dispatch if max_dispatch is not None else run.params().get("max_parallel", 4)) - len(inflight)
+    emitted = [dict(t) for t in run.q("SELECT * FROM tasks WHERE manual=0 AND status='ready' ORDER BY id")]  # emitted, delegation unconfirmed: still occupy a slot
+    slots = (max_dispatch if max_dispatch is not None else run.params().get("max_parallel", 4)) - len(inflight) - len(emitted)
     max_per_option = run.params().get("max_per_option", 3)
     halt_raw = run.meta("halt")
     halted = json.loads(halt_raw) if halt_raw else None
     planned = [dict(t) for t in run.q("SELECT * FROM tasks WHERE manual=0 AND status='planned' ORDER BY id")]
     load: dict = {}
-    for t in inflight:
+    for t in inflight + emitted:
         if t["option"]:
             load[t["option"]] = load.get(t["option"], 0) + 1
     ready, capped = [], []
@@ -539,24 +557,33 @@ def next_actions(run: Run, max_dispatch=None, dispatch=False, available=None) ->
         if opt:
             load[opt] = load.get(opt, 0) + 1
         ready.append((t, opt, onote))
+    payload_name = None
+    if ready:  # a dry run never touches an emitted payload file: it writes a separate preview
+        n = int(run.meta("ctr:dispatch", 0)) + 1
+        payload_name = f"dispatch_{n:03d}.json" if dispatch else "dispatch_dryrun.json"
     payload = []
     for t, opt, onote in ready:
         b = run.block(t["block"])
         contract = run.p("tasks", t["id"], "contract.md")
         payload.append({"task_id": t["id"], "block": t["block"], "role": t["role"], "coder": t["coder"], "option": opt, "option_note": onote,
-                        "goal": f"{b.get('goal') or b['purpose']} — 계약서 {contract} 를 처음부터 끝까지 읽고 그대로 수행하십시오.",
-                        "context": contract.read_text(encoding="utf-8")})
+                        "goal": _goal_text(t["id"], t["block"], t["role"], contract),
+                        "context": contract.read_text(encoding="utf-8") if full else _pointer_text(run.meta("run_id"), t["id"], contract)})
         if dispatch:
-            run.db.execute("UPDATE tasks SET status='dispatched', dispatched=?, option=? WHERE id=?", (now(), opt, t["id"]))
-            run.event("dispatch", t["id"], option=opt)
+            run.db.execute("UPDATE tasks SET status='ready', option=? WHERE id=?", (opt, t["id"]))  # `dispatched` stays NULL until delegation is confirmed
+            run.event("dispatch_emitted", t["id"], option=opt, payload=payload_name)
     payload_path = None
     if payload:
-        n = int(run.meta("ctr:dispatch", 0)) + (1 if dispatch else 0)
         if dispatch:
             run.set_meta("ctr:dispatch", n)
-        payload_path = run.p("staging", f"dispatch_{n:03d}.json")
+        payload_path = run.p("staging", payload_name)
         payload_path.write_text(jdump({"tasks": [{"goal": p["goal"], "context": p["context"], **({"option": p["option"]} if p["option"] else {})} for p in payload],
                                        "meta": [{k: p[k] for k in ("task_id", "block", "role", "coder", "option", "option_note")} for p in payload]}), encoding="utf-8")
+    emitted_out = []
+    for t in emitted:
+        ev = run.one("SELECT detail FROM events WHERE kind='dispatch_emitted' AND task_id=? ORDER BY id DESC LIMIT 1", (t["id"],))
+        name = (json.loads(ev["detail"]) if ev and ev["detail"] else {}).get("payload")
+        emitted_out.append({"task_id": t["id"], "block": t["block"], "role": t["role"], "option": t["option"], "payload": name,
+                            "payload_path": str(run.p("staging", name)) if name else None})
     parent = []
     for b in spec_blocks:
         if b["role"] == "Parent" and bstate(run, b["id"])["status"] == "active" and open_tasks(run, b["id"]):
@@ -575,7 +602,7 @@ def next_actions(run: Run, max_dispatch=None, dispatch=False, available=None) ->
     phase = next((b["phase"] for b in spec_blocks if bstate(run, b["id"])["status"] != "complete"), "done")
     if dispatch and payload:
         run.bump()
-    return {"phase": phase, "done": done, "dispatch": payload, "payload_path": str(payload_path) if payload_path else None, "parent": parent,
+    return {"phase": phase, "done": done, "dispatch": payload, "payload_path": str(payload_path) if payload_path else None, "dry_run": not dispatch, "emitted": emitted_out, "parent": parent,
             "inflight": [{"task_id": t["id"], "block": t["block"], "role": t["role"], "coder": t["coder"], "status": t["status"], "option": t["option"]} for t in inflight],
             "queued": len(planned) - len(ready), "capped": capped, "halted": halted, "blocked": blocked, "notes": notes,
             "blocks": {"complete": sum(bstate(run, b["id"])["status"] == "complete" for b in spec_blocks), "total": len(spec_blocks)}}
@@ -587,11 +614,77 @@ def begin_task(run: Run, tid: str) -> dict:
         die(f"unknown task: {tid}")
     if t["status"] in ("verified",):
         die(f"{tid} is already verified")
-    run.db.execute("UPDATE tasks SET begun=?, status=CASE WHEN status='planned' THEN 'dispatched' ELSE status END WHERE id=?", (now(), tid))
+    ts = now()  # a child that runs begin was certainly delegated: promote planned/ready and stamp the first dispatch time
+    run.db.execute("UPDATE tasks SET begun=?, dispatched=COALESCE(dispatched, ?), status=CASE WHEN status IN ('planned','ready') THEN 'dispatched' ELSE status END WHERE id=?", (ts, ts, tid))
     run.event("begin", tid)
     idir = run.p("tasks", tid, "input")
     return {"task": tid, "receipt": t["receipt"], "input_sha": t["input_sha"][:12], "inputs": sorted(str(p) for p in idir.glob("*")),
             "out": str(run.p("staging", "out", f"{tid}.jsonl"))}
+
+
+def payload_task_ids(run: Run, payload) -> list[str]:
+    """Task ids of a dispatch payload file (a path, or a bare file name under the run's staging directory)."""
+    p = Path(payload)
+    if not p.is_file() and p.name == str(payload):
+        p = run.p("staging", p.name)
+    if not p.is_file():
+        die(f"payload not found: {payload} (give a path or a file name under {run.p('staging')})")
+    try:
+        ids = [m["task_id"] for m in json.loads(p.read_text(encoding="utf-8"))["meta"]]
+        if not ids or not all(isinstance(i, str) for i in ids):
+            raise ValueError("meta lists no task ids")
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        die(f"unreadable dispatch payload {p}: {e!r}")
+    return ids
+
+
+def _transition(run: Run, ids, allowed, verb: str, apply) -> list[str]:
+    """All-or-nothing status change: every task must exist and be in `allowed`, else die listing the offenders and change nothing."""
+    ids = list(dict.fromkeys(ids))
+    rows, bad = [], []
+    for tid in ids:
+        t = run.one("SELECT * FROM tasks WHERE id=?", (tid,))
+        if not t:
+            bad.append(f"{tid} (unknown task)")
+        elif t["status"] not in allowed:
+            bad.append(f"{tid} ({t['status']})")
+        else:
+            rows.append(t)
+    if bad:
+        die(f"{verb}: nothing changed; not allowed for: " + ", ".join(bad))
+    run.db.execute("BEGIN")
+    try:
+        for t in rows:
+            apply(t)
+        run.db.execute("COMMIT")
+    except BaseException:
+        run.db.execute("ROLLBACK")
+        raise
+    return [t["id"] for t in rows]
+
+
+def confirm_dispatched(run: Run, ids) -> tuple[list[str], list[str]]:
+    """The parent really called delegate_task: ready -> dispatched. Already dispatched/returned tasks are accepted as confirmed.
+
+    Returns (promoted, already_confirmed).
+    """
+    promoted = []
+
+    def apply(t):
+        if t["status"] == "ready":
+            run.db.execute("UPDATE tasks SET status='dispatched', dispatched=? WHERE id=?", (now(), t["id"]))
+            run.event("dispatch", t["id"], option=t["option"])
+            promoted.append(t["id"])
+    done = _transition(run, ids, ("ready", "dispatched", "returned"), "dispatched", apply)
+    return promoted, [i for i in done if i not in promoted]
+
+
+def unready_tasks(run: Run, ids) -> list[str]:
+    """The parent decided NOT to delegate: ready -> planned, no attempt, same receipt (retry is for tasks that ran)."""
+    def apply(t):
+        run.db.execute("UPDATE tasks SET status='planned' WHERE id=?", (t["id"],))
+        run.event("dispatch_cancelled", t["id"], option=t["option"])
+    return _transition(run, ids, ("ready",), "unready", apply)
 
 
 def done_block(run: Run, bid: str, note=None) -> int:
@@ -660,8 +753,10 @@ def retry_task(run: Run, tid: str, option=None, note=None, cause=None) -> None:
         cls, kind, source = cause, (kind if cause == "env" and cls == "env" else None), "explicit"
     if source != "none":
         note = f"[{cls}:{kind}] {note}" if kind else f"[{cls}] {note}"
-    run.db.execute("UPDATE tasks SET status='planned', attempts=attempts+1, notes=?, option=COALESCE(?,option), receipt=?, begun=NULL WHERE id=?",
-                   (note, option, _receipt(run, tid, t["input_sha"], t["attempts"] + 1), tid))
+    # a failure report means the task was handed to delegate_task even if the child never ran `begin` (e.g. a 402 at call time): record that;
+    # a task that was never delegated goes back with `unready`, which does not touch `dispatched`
+    run.db.execute("UPDATE tasks SET status='planned', attempts=attempts+1, notes=?, option=COALESCE(?,option), receipt=?, begun=NULL, dispatched=COALESCE(dispatched, ?) WHERE id=?",
+                   (note, option, _receipt(run, tid, t["input_sha"], t["attempts"] + 1), now() if t["status"] == "ready" else None, tid))
     out = run.p("staging", "out", f"{tid}.jsonl")
     if out.exists():
         out.rename(out.with_suffix(f".attempt{t['attempts']}.jsonl"))
@@ -671,13 +766,14 @@ def retry_task(run: Run, tid: str, option=None, note=None, cause=None) -> None:
 
 
 def _maybe_halt_billing(run: Run, block: str, wave: int) -> None:
-    """Halt dispatch when every dispatched, unfinished task of (block, wave) last failed with billing on one option.
+    """Stop dispatch when every delegated, unfinished task of (block, wave) last failed with billing on one option.
 
-    Tasks never dispatched (e.g. held back by max_per_option) have no option or retry event yet and are not part of the group.
+    Tasks never emitted (e.g. held back by max_per_option) have no option or retry event yet and are not part of the group; tasks emitted
+    but not yet reported ('ready') are, so an unreported sibling still blocks the stop.
     """
     if run.meta("halt"):
         return
-    group = run.q("SELECT id, option FROM tasks WHERE manual=0 AND block=? AND wave=? AND status!='verified' AND dispatched IS NOT NULL ORDER BY id", (block, wave))
+    group = run.q("SELECT id, option FROM tasks WHERE manual=0 AND block=? AND wave=? AND status!='verified' AND (dispatched IS NOT NULL OR status='ready') ORDER BY id", (block, wave))
     if len(group) < 2 or len({g["option"] for g in group}) != 1:
         return
     for g in group:
@@ -724,6 +820,7 @@ def metrics(run: Run) -> dict:
     claims = {r["status"]: r["n"] for r in run.q("SELECT status, COUNT(*) n FROM claims GROUP BY 1")}
     return {
         "tasks": n_t, "tasks_verified": sum(t["status"] == "verified" for t in tasks), "tasks_rework": rework,
+        "task_status": dict(sorted(Counter(t["status"] for t in tasks).items())),
         "rework_rate": round(rework / n_t, 3) if n_t else 0.0, "rows_ok": ok, "rows_rejected": rej,
         "reject_rate": round(rej / (ok + rej), 4) if (ok + rej) else 0.0,
         "sources": run.one("SELECT COUNT(*) n FROM sources WHERE status='active'")["n"],
@@ -769,6 +866,10 @@ def suggestions(run: Run, m: dict) -> list[str]:
     return s
 
 
+def _task_states(counts: dict) -> str:
+    return " ".join(f"{k}={n}" for k, n in counts.items()) or "none"
+
+
 def status_text(run: Run) -> str:
     spec = run.spec
     L = [f"RUN {run.meta('run_id')}  workflow={run.meta('workflow_id')}  root={run.root}", ""]
@@ -781,7 +882,7 @@ def status_text(run: Run) -> str:
     L += ["", "GATES (global)"]
     L.append(table([(n, (r := gates_mod.evaluate(run, n))["status"], r["value"], r["threshold"], r["detail"][:80]) for n in applicable_gates(run)], ["gate", "status", "value", "threshold", "detail"]))
     c = run.one("SELECT (SELECT COUNT(*) FROM sources WHERE status='active') s, (SELECT COUNT(*) FROM evidence WHERE is_null=0) e, (SELECT COUNT(*) FROM claims) k, (SELECT COUNT(*) FROM rejects) r")
-    L += ["", f"sources={c['s']} evidence={c['e']} claims={c['k']} rejects={c['r']}"]
+    L += ["", "tasks: " + _task_states(metrics(run)["task_status"]), f"sources={c['s']} evidence={c['e']} claims={c['k']} rejects={c['r']}"]
     return "\n".join(L)
 
 
@@ -789,6 +890,7 @@ def report_md(run: Run) -> str:
     m = metrics(run)
     L = [f"# Status report — {run.meta('run_id')}", "", f"- workflow: `{run.meta('workflow_id')}` · generated {now()}",
          f"- tasks {m['tasks_verified']}/{m['tasks']} verified · rework {m['rework_rate']:.0%} · rows ok/rejected {m['rows_ok']}/{m['rows_rejected']}",
+         f"- task states: {_task_states(m['task_status'])}",
          f"- sources {m['sources']} · evidence {m['evidence']} · claims {m['claims_total']} ({m['claims']})", "", "## Gates", "",
          "| gate | status | value | detail |", "|---|---|---|---|"]
     for n in applicable_gates(run):
