@@ -188,6 +188,15 @@ def _brief_excerpt(run: Run, n=1400) -> str:
     return t if len(t) <= n else t[:n] + "\n...(이하 생략; 전문은 brief.md)"
 
 
+_ADDENDUM_RULE = "where it conflicts with the contract, the addendum's prohibitions and limits take precedence"
+
+
+def _addendum(run: Run) -> Path | None:
+    """Run-level operating rules written by the parent. The path is derived from the run directory (ASCII as long as RLAB_HOME is)."""
+    p = run.p("addendum.md")
+    return p if p.is_file() else None
+
+
 def build_contract(run: Run, task: dict, b: dict, inputs: dict[str, Path], extra: list[str]) -> str:
     tid, out = task["id"], run.p("staging", "out", f"{task['id']}.jsonl")
     cmd = rlab_cmd()
@@ -196,8 +205,10 @@ def build_contract(run: Run, task: dict, b: dict, inputs: dict[str, Path], extra
     L = [f"# 작업 계약 {tid} — {b['role']}{('.' + task['coder']) if task['coder'] else ''}", "",
          f"- run: `{run.meta('run_id')}` · 블록: `{b['id']}` (wave {task['wave']})",
          f"- 목표: {b.get('goal') or b['purpose']}", "",
-         "## 연구 맥락 (요약)", "", _brief_excerpt(run), "",
-         "## 질문 트리", ""]
+         "## 연구 맥락 (요약)", "", _brief_excerpt(run), ""]
+    if _addendum(run):
+        L += [f"- 런 부록 `{_addendum(run)}`도 반드시 읽으십시오. 계약과 충돌하면 부록의 금지·제한이 우선합니다.", ""]
+    L += ["## 질문 트리", ""]
     for q in ex_questions(run):
         L.append(f"- {q['id']} [{q['kind']}] {q['text']}" + (f"  (parent {q['parent']})" if q["parent"] else ""))
     L += ["", "## 입력 (읽기 전용, 절대경로)", ""]
@@ -430,6 +441,63 @@ def reopen(run: Run, bid: str, note="") -> list[str]:
     return touched
 
 
+def refresh_inputs(run: Run, bid: str, dry_run=False) -> tuple[list[str], list[str]]:
+    """Rebuild the input snapshots of a block whose open tasks were never started: cancel them and re-run the block's own expansion.
+
+    All preconditions are checked before any change. Returns (old task ids, new task ids); a dry run returns (old ids, []).
+    """
+    b = run.block(bid)
+    if b["role"] == "Parent":
+        die(f"refresh-inputs: {bid} is a Parent block (manual tasks have no input snapshots)")
+    tasks = open_tasks(run, bid)
+    if not tasks:
+        die(f"refresh-inputs: {bid} has no open task; use `reopen` for a new wave")
+    bad = []
+    for t in tasks:
+        why = [f"{k}={t[k]}" for k in ("status", "manual", "attempts", "dispatched", "begun") if t[k] != {"status": "planned", "manual": 0, "attempts": 0, "dispatched": None, "begun": None}[k]]
+        if run.one("SELECT 1 FROM events WHERE kind='dispatch_emitted' AND task_id=?", (t["id"],)):
+            why.append("dispatch_emitted")
+        if run.p("staging", "out", f"{t['id']}.jsonl").exists():
+            why.append("output file")
+        if why:
+            bad.append(f"{t['id']} ({', '.join(why)})")
+    if bad:
+        die(f"refresh-inputs: nothing changed; {bid} has tasks that were emitted, started or retried (re-expanding would duplicate work): " + "; ".join(bad)
+            + ". Use `retry`, `unready` or `reopen` (a new wave) instead.")
+    waves = {t["wave"] for t in tasks}
+    if len(waves) > 1:
+        die(f"refresh-inputs: nothing changed; open tasks of {bid} span several waves {sorted(waves)}")
+    wave, old = waves.pop(), [t["id"] for t in sorted(tasks, key=lambda t: t["id"])]
+    if dry_run:
+        return old, []
+    before = {p.name for p in run.p("tasks").iterdir()}
+    run.db.execute("BEGIN")
+    try:
+        for tid in old:
+            run.db.execute("UPDATE candidates SET status='new', assigned_to=NULL WHERE assigned_to=?", (tid,))
+            run.db.execute("DELETE FROM tasks WHERE id=?", (tid,))
+        new = expand_block(run, b, wave)
+        if not new:
+            die(f"refresh-inputs: nothing changed; re-expanding {bid} wave {wave} would create no task (nothing left to process)")
+        marks = ",".join("?" * len(new))  # some expansions (per_lane) do not skip work that already exists: refuse instead of duplicating it
+        fresh = {x["fanout_key"] for x in run.q(f"SELECT fanout_key FROM tasks WHERE id IN ({marks})", tuple(new))}
+        dup = sorted(fresh & {x["fanout_key"] for x in run.q(f"SELECT fanout_key FROM tasks WHERE block=? AND fanout_key IS NOT NULL AND id NOT IN ({marks})", (bid, *new))})
+        if dup:
+            die(f"refresh-inputs: nothing changed; re-expanding {bid} wave {wave} would recreate work that already exists (fanout keys {', '.join(dup)}); "
+                "use `retry` for failed tasks or `reopen` for a new wave")
+        run.event("inputs_refreshed", None, block=bid, wave=wave, old=old, new=new)
+        run.db.execute("COMMIT")
+    except BaseException:
+        run.db.execute("ROLLBACK")
+        for p in run.p("tasks").iterdir():
+            if p.name not in before:
+                shutil.rmtree(p, ignore_errors=True)
+        raise
+    for tid in old:  # only after the commit: a failed refresh must leave the old tasks intact
+        shutil.rmtree(run.p("tasks", tid), ignore_errors=True)
+    return old, new
+
+
 def _autocheck(run: Run, b: dict) -> bool:
     bid = b["id"]
     if bid == "intake":
@@ -526,10 +594,20 @@ def _goal_text(tid: str, bid: str, role: str, contract: Path) -> str:
             "from start to end and follow its required procedure exactly.")
 
 
-def _pointer_text(run_id: str, tid: str, contract: Path) -> str:
+def _pointer_text(run_id: str, tid: str, contract: Path, addendum: Path | None = None) -> str:
     """ASCII pointer sentence used as delegate_task `context` unless `next --full` embeds the whole contract."""
-    return (f"run={run_id} task={tid}. The full task contract is the file {contract} . First read that whole file with a file-read or terminal tool, "
+    text = (f"run={run_id} task={tid}. The full task contract is the file {contract} . First read that whole file with a file-read or terminal tool, "
             "then follow its required procedure (begin -> write output -> check) exactly. There are no instructions outside the contract.")
+    if addendum:
+        text += f" Exception: the run-level addendum {addendum} must be read too; {_ADDENDUM_RULE}."
+    return text
+
+
+def _full_text(contract: Path, addendum: Path | None) -> str:
+    text = contract.read_text(encoding="utf-8")
+    if addendum:
+        text += (f"\n## Run addendum ({addendum.name})\n\nRead this too; {_ADDENDUM_RULE}.\n\n" + addendum.read_text(encoding="utf-8").strip() + "\n")
+    return text
 
 
 def next_actions(run: Run, max_dispatch=None, dispatch=False, available=None, full=False) -> dict:
@@ -562,12 +640,13 @@ def next_actions(run: Run, max_dispatch=None, dispatch=False, available=None, fu
         n = int(run.meta("ctr:dispatch", 0)) + 1
         payload_name = f"dispatch_{n:03d}.json" if dispatch else "dispatch_dryrun.json"
     payload = []
+    addendum = _addendum(run)
     for t, opt, onote in ready:
         b = run.block(t["block"])
         contract = run.p("tasks", t["id"], "contract.md")
         payload.append({"task_id": t["id"], "block": t["block"], "role": t["role"], "coder": t["coder"], "option": opt, "option_note": onote,
                         "goal": _goal_text(t["id"], t["block"], t["role"], contract),
-                        "context": contract.read_text(encoding="utf-8") if full else _pointer_text(run.meta("run_id"), t["id"], contract)})
+                        "context": _full_text(contract, addendum) if full else _pointer_text(run.meta("run_id"), t["id"], contract, addendum)})
         if dispatch:
             run.db.execute("UPDATE tasks SET status='ready', option=? WHERE id=?", (opt, t["id"]))  # `dispatched` stays NULL until delegation is confirmed
             run.event("dispatch_emitted", t["id"], option=opt, payload=payload_name)

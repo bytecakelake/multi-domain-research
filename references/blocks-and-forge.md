@@ -47,6 +47,7 @@ core 블록(intake, qtree, analyze-claims, synthesize, retro)은 `--drop` 할 �
 - `per_lane`: 레인마다 1 task · `candidate_batch`: 신규 후보를 batch로 묶음 · `source_batch`: 아직 추출 안 된 정상(pii clear) 출처를 batch로 묶음(dual이면 겹치는 출처는 A·B 둘 다, 나머지는 A/B 교차 배정; 겹침은 출처 id 해시로 결정적).
 - `per_question`: 근거(또는 주장)가 있는 최상위 질문마다 1 task, 근거 수가 바뀌면 새 task가 생김 · `claim_batch`: 미반증 주장을 강도순으로 묶음 · `per_data_question`: 데이터셋이 있고 kind∈measure|compare|trend|rank인 질문.
 - 모든 fanout은 **데이터 기반 지연 확장**이라 재개방(새 wave)에서 새 입력만 처리합니다.
+- **입력 스냅샷은 task 생성 시점에 한 번만 만들어집니다.** `reopen`은 이미 내보낸(ready·dispatched·returned) task를 건드리지 않고 다음 wave만 새로 확장합니다. 아직 시작하지 않은 planned task의 입력이 낡았다면(부모가 `source add`로 출처를 시딩했거나 후보가 추가된 경우 등) 파일을 손으로 덮어쓰지 말고 `rlab refresh-inputs --block B [--dry-run]`를 쓰십시오: 그 블록의 열린 task를 취소하고 블록 자신의 확장(`expand_block`)을 다시 실행하므로 입력·계약서·receipt가 생성 때와 똑같은 코드로 새로 만들어집니다(새 task id; 옛 task의 후보 배정은 풀려 다시 묶이고, `inputs_refreshed` 이벤트와 "옛 -> 새" id 출력; `block_state`는 불변). **전부** 열린 task가 `planned`·수동 아님·`attempts=0`·`dispatched`/`begun` 비어 있음·`dispatch_emitted` 이벤트 없음·`staging/out/<T>.jsonl` 없음이어야 하고, 같은 wave여야 하며 Parent 블록이 아니어야 합니다. 하나라도 어기면(내보냈거나 시작했거나 재시도한 task가 있으면 다시 확장하는 것이 이미 내보낸 작업을 중복시키므로) 변경 없이 거부하며 `retry`·`unready`·`reopen`(새 wave)으로 안내합니다. 다시 확장해도 task가 하나도 안 생기면(처리할 것이 없으면) 역시 거부하고 아무것도 바꾸지 않습니다. 모든 변경은 한 트랜잭션이고 옛 task 디렉터리는 커밋 뒤에만 지우며, 실패하면 DB와 새로 만든 디렉터리까지 원상 복구합니다.
 
 ## 블록 추가·수정(카탈로그 확장)
 

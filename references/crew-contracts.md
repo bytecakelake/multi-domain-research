@@ -24,6 +24,8 @@
 
 **디스패치 상태와 ASCII 페이로드(E2)**: `next --dispatch`는 task를 `ready`(페이로드에 실렸을 뿐 위임 미확인)로 바꾸고 `dispatch_emitted` 이벤트와 `staging/dispatch_NNN.json`을 남깁니다(`tasks.dispatched`는 비워 둡니다). `ready` task는 다시 내보내지 않고 `next`가 `[EMITTED, NOT CONFIRMED]`로 나열하며, `max_parallel`·`max_per_option` 계산에는 진행 중으로 셉니다. `delegate_task`를 실제로 호출한 뒤 `rlab dispatched --payload dispatch_NNN.json`(또는 `--task T` 반복)으로 `ready → dispatched`를 확정합니다(자식의 `begin`도 확정합니다; 이미 dispatched/returned는 조용히 통과, 다른 상태가 하나라도 있으면 전체 거부). 위임하지 않기로 했다면 `rlab unready --payload ...`(또는 `--task`)로 `ready → planned`로 되돌립니다(attempts·receipt 불변, `dispatch_cancelled` 이벤트; `retry`는 위임했는데 실패한 시도에 씁니다: `ready` 상태에서 `retry`하면 위임된 것으로 기록되므로 위임 시점의 402처럼 자식이 `begin`하지 못한 실패도 결제 중단 판정에 포함됩니다). 페이로드의 `goal`/`context`는 task id·블록·역할·`contract.md` 절대경로만 담은 **ASCII 고정 문장**이므로 손으로 다시 쓰지 말고 `next`가 출력한 JSON을 그대로 전달하십시오(한글 목적·목표는 `contract.md`와 페이로드 `meta`에만 있고 `meta`는 `delegate_task`로 보내지 않습니다). 전문이 필요하면 `next --full`. run id와 `RLAB_HOME` 경로가 ASCII여야 이 보장이 성립하며, 아니면 `next`가 stderr에 경고합니다. `--dispatch` 없는 `next`는 `dispatch_dryrun.json`에만 씁니다.
 
+**run 부록(addendum, E6)**: 계약서는 brief를 앞 1400자만 담으므로, 뒤늦게 정한 운영 규칙(수집 경계·origin 정의·질문별 코딩 규칙 등)은 run 디렉터리의 `addendum.md`에 적으십시오. `next`가 페이로드를 만들 때 `addendum.md`가 있으면 자동으로 포함됩니다: 기본 ASCII `context` 포인터에 부록의 절대경로와 "함께 읽을 것, 계약과 충돌하면 부록의 금지·제한이 우선"이라는 ASCII 문장 하나가 붙고, `next --full`은 계약서 뒤에 부록 본문을 제목과 같은 우선 규칙 문장과 함께 덧붙입니다(`goal`은 그대로). 부록이 이미 있을 때 만든 새 계약서에도 같은 안내 한 줄이 들어갑니다. 부록이 없으면 페이로드는 바이트 단위로 이전과 같습니다. 부모가 디스패치 페이로드에 부록 경로를 손으로 넣거나 brief에 포인터를 쓸 필요가 없습니다(부록 경로는 run 디렉터리에서 유도되므로 `RLAB_HOME`이 ASCII인 한 ASCII입니다).
+
 ## 수신증(receipt)과 기계 검증
 
 1. 자식이 `begin --task T` 실행 → `receipt = sha256(run_key | task | input_sha)[:12]`(run_key는 원장에만 있어 추측 불가).

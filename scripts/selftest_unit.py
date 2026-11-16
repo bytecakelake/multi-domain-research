@@ -887,6 +887,149 @@ r, ts, sent = e2_billing_run("e2b2", 2, 3)
 runtime.unready_tasks(r, sent)
 check(all(r.one("SELECT status s, dispatched d FROM tasks WHERE id=?", (t,))["s"] == "planned" and r.one("SELECT dispatched d FROM tasks WHERE id=?", (t,))["d"] is None for t in sent), "E2xE3: unready leaves dispatched NULL (never delegated)")
 
+# 30 E6: a run-level addendum.md reaches every child automatically (pointer sentence, --full section, new contracts)
+def e6_ctx(r, **kw):
+    rc, out, err = e2_next(r, dispatch=False, **kw)
+    return json.loads(out)["dispatch"][0], err
+def e6_addendum():
+    r = setup("e6add", ["scout"]); t = task(r, "scout", None)
+    contract = r.p("tasks", t, "contract.md"); base = runtime._pointer_text(r.meta("run_id"), t, contract)
+    d0, err0 = e6_ctx(r); f0, _ = e6_ctx(r, full=True)
+    check(d0["context"] == base and "addendum" not in base and f0["context"] == contract.read_text(encoding="utf-8"), "E6: without addendum.md the default context is the unchanged pointer text and --full is the bare contract")
+    add = "수집 경계: 공개 자료만 사용. 금지: 로그인."
+    r.p("addendum.md").write_text(add, encoding="utf-8")
+    ap = str(r.p("addendum.md")); d1, err1 = e6_ctx(r)
+    check(ap in d1["context"] and "prohibitions and limits take precedence" in d1["context"] and d1["context"].isascii() and d1["context"].startswith(base) and err1 == "", "E6: with addendum.md the ASCII pointer names its absolute path plus the precedence sentence and still starts with the unchanged pointer")
+    check(d1["goal"] == d0["goal"] and d1["goal"].isascii(), "E6: the goal is unchanged by the addendum")
+    f1, _ = e6_ctx(r, full=True); ctx = f1["context"]
+    check(ctx.startswith(contract.read_text(encoding="utf-8")) and add in ctx and "## Run addendum" in ctx and "prohibitions and limits take precedence" in ctx and ctx.index("## Run addendum") < ctx.index(add) and f1["goal"] == d0["goal"], "E6: --full appends the Korean addendum text under a heading with the precedence sentence; goal stays ASCII")
+    t2 = task(r, "scout", None)
+    check(ap in r.p("tasks", t2, "contract.md").read_text(encoding="utf-8") and ap not in contract.read_text(encoding="utf-8"), "E6: a contract created while addendum.md exists mentions its path; earlier contracts are untouched")
+e2_case(e6_addendum)
+
+# 31 E6: refresh-inputs rebuilds stale snapshots of never-started tasks through the block's own expansion
+def e6_snap(r):
+    db = core.Run(r.root).db
+    tabs = {t: [tuple(x) for x in db.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall()] for t in ("tasks", "candidates", "events", "block_state", "meta", "sources")}
+    files = sorted((str(p.relative_to(r.root)), p.read_bytes()) for p in r.root.rglob("*") if p.is_file() and not p.name.startswith("ledger.sqlite"))
+    return tabs, files, sorted(str(p.relative_to(r.root)) for p in r.root.rglob("*") if p.is_dir())
+def e6_run(case, bid, params=None, bparams=None, seed=None, wave=1):
+    r = setup(case, [bid], params); question(r)
+    if bparams:
+        spec = json.loads(r.p("workflow.json").read_text()); spec["blocks"][0]["params"].update(bparams)
+        r.p("workflow.json").write_text(json.dumps(spec)); r._spec = None
+    if seed: seed(r)
+    ids = runtime.expand_block(r, r.block(bid), wave)
+    r.db.execute("UPDATE block_state SET status='active', waves=? WHERE block=?", (wave, bid))
+    return r, ids
+def e6_cand(r, n):
+    for i in range(n):
+        r.db.execute("INSERT INTO candidates(url,title,why,lane) VALUES(?,?,?,?)", (f"https://x.test/{r.nid('U')}", "t", "w", "l"))
+def e6_inp(r, t, name):
+    p = r.p("tasks", t, "input", name)
+    return core.read_jsonl(p) if name.endswith(".jsonl") else json.loads(p.read_text(encoding="utf-8"))
+def e6_refuse(label, r, bid, needle=None):
+    before = e6_snap(r); msg = e2_dies(runtime.refresh_inputs, r, bid)
+    check(msg is not None and (needle is None or needle in msg) and e6_snap(r) == before, f"E6: refresh-inputs refuses {label} and changes nothing")
+    return msg
+def e6_refresh():
+    # single fanout: a stale empty sources.jsonl gets the source seeded after creation
+    r, (old,) = e6_run("e6sa", "source-audit")
+    old_row = dict(e2_row(r, old)); old_sha = old_row["input_sha"]
+    sid = source(r, "abcdefghijk audit text with enough characters to pass", "og1")[2]
+    check(e6_inp(r, old, "sources.jsonl") == [], "E6 setup: the snapshot taken at creation has no sources")
+    bs = [tuple(x) for x in r.q("SELECT * FROM block_state")]
+    rc, out, err = e2_out(cli.cmd_refresh_inputs, argparse.Namespace(run=str(r.root), block="source-audit", dry_run=False))
+    new = [x["id"] for x in r.q("SELECT id FROM tasks WHERE block='source-audit'")]
+    check(rc == 0 and len(new) == 1 and new[0] != old and old in out and new[0] in out and "->" in out, "E6: refresh-inputs prints old -> new task ids")
+    check(e2_row(r, old) is None and not r.p("tasks", old).exists() and e2_row(r, new[0])["status"] == "planned", "E6: the old task row and directory are gone; the replacement is planned")
+    nr = dict(e2_row(r, new[0]))
+    check([s["id"] for s in e6_inp(r, new[0], "sources.jsonl")] == [sid] and nr["input_sha"] != old_sha and nr["receipt"] != old_row["receipt"] and nr["receipt"] == runtime._receipt(r, new[0], nr["input_sha"], 0), "E6: the new task carries the new source in input/sources.jsonl with a fresh input_sha and receipt")
+    check(core.sha256_file(r.p("tasks", new[0], "input", "sources.jsonl"))[:12] in r.p("tasks", new[0], "contract.md").read_text(encoding="utf-8"), "E6: the new contract.md was written")
+    evs = e2_ev(r, "inputs_refreshed")
+    check(len(evs) == 1 and evs[0]["block"] == "source-audit" and evs[0]["wave"] == 1 and evs[0]["old"] == [old] and evs[0]["new"] == new, "E6: an inputs_refreshed event records block, wave, old and new ids")
+    check([tuple(x) for x in r.q("SELECT * FROM block_state")] == bs, "E6: block_state is unchanged")
+    # candidate_batch: the late candidate and the originally assigned ones are re-batched; nothing stays on a deleted task
+    r, olds = e6_run("e6cb", "collect", bparams={"batch": 2}, seed=lambda r: e6_cand(r, 3))
+    check(len(olds) == 2, "E6 setup: three candidates in two batches")
+    e6_cand(r, 1)
+    olds2, new = runtime.refresh_inputs(r, "collect")
+    cids = sorted(c["cid"] for t in new for c in e6_inp(r, t, "candidates.jsonl"))
+    asg = {x["id"]: x["assigned_to"] for x in r.q("SELECT id, assigned_to FROM candidates")}
+    check(len(new) == 2 and cids == [1, 2, 3, 4] and all(v in new for v in asg.values()) and olds2 == olds and not any(e2_row(r, o) for o in olds) and not any(r.p("tasks", o).exists() for o in olds), "E6: candidate_batch re-batches the old and the late candidates; none stays assigned to a deleted task")
+    # source_batch: a source seeded after creation is included
+    ref = {}
+    r, olds = e6_run("e6sb", "extract-single", seed=lambda r: ref.update(s1=source(r, "abcdefghijk first source with enough characters to pass", "og1")[2])); s1 = ref["s1"]
+    s2 = source(r, "abcdefghijk second source with enough characters to pass", "og2")[2]
+    olds2, new = runtime.refresh_inputs(r, "extract-single")
+    check(olds2 == olds and sorted(s["id"] for t in new for s in e6_inp(r, t, "sources.jsonl")) == sorted([s1, s2]), "E6: source_batch includes a source seeded after creation")
+    # per_lane: the whole multi-task wave is rebuilt without duplicate lanes
+    r, olds = e6_run("e6pl", "scout", {"lanes": [{"name": "a", "desc": "x"}, {"name": "b", "desc": "y"}]})
+    olds2, new = runtime.refresh_inputs(r, "scout")
+    rows = r.q("SELECT fanout_key FROM tasks WHERE block='scout'")
+    check(len(olds) == 2 and sorted(olds2) == sorted(olds) and len(new) == 2 and sorted(x["fanout_key"] for x in rows) == ["a@1", "b@1"] and not set(olds) & set(new), "E6: per_lane wave is refreshed wholesale, no duplicate lanes")
+e2_case(e6_refresh)
+
+def e6_refusals():
+    lanes = {"lanes": [{"name": "a", "desc": "x"}, {"name": "b", "desc": "y"}]}
+    r, ts = e6_run("e6r1", "scout", lanes); runtime.next_actions(r, max_dispatch=1, dispatch=True)
+    check(e2_row(r, ts[0])["status"] == "ready", "E6 setup: one task is ready")
+    msg = e6_refuse("a block with a ready task", r, "scout", ts[0])
+    check(msg and all(w in msg for w in ("retry", "unready", "reopen")), "E6: the refusal points to retry, unready and reopen")
+    runtime.confirm_dispatched(r, [ts[0]]); e6_refuse("a block with a dispatched task", r, "scout", ts[0])
+    r, ts = e6_run("e6r2", "scout", lanes); r.db.execute("UPDATE tasks SET attempts=1 WHERE id=?", (ts[1],)); e6_refuse("a retried task (attempts>0)", r, "scout", ts[1])
+    r, ts = e6_run("e6r3", "scout", lanes); r.p("staging", "out", f"{ts[0]}.jsonl").write_text("{}\n"); e6_refuse("a task that already has an output file", r, "scout", ts[0])
+    r, ts = e6_run("e6r4", "scout", lanes); r.event("dispatch_emitted", ts[0], option=None, payload="x"); e6_refuse("a planned task with a dispatch_emitted event", r, "scout", ts[0])
+    r, ts = e6_run("e6r5", "scout", lanes); r.db.execute("UPDATE tasks SET begun='x' WHERE id=?", (ts[0],)); e6_refuse("a task with begun set", r, "scout", ts[0])
+    r, ts = e6_run("e6r6", "scout", lanes); r.db.execute("UPDATE tasks SET manual=1 WHERE id=?", (ts[0],)); e6_refuse("a manual task", r, "scout", ts[0])
+    r, ts = e6_run("e6r7", "scout", lanes); task(r, "scout", None, wave=2); e6_refuse("open tasks of mixed waves", r, "scout", "wave")
+    r = setup("e6r8", ["intake"]); runtime.make_task(r, r.block("intake"), 1, {}, manual=True); e6_refuse("a Parent block", r, "intake", "Parent")
+    r = setup("e6r9", ["scout"]); e6_refuse("an unknown block", r, "nope", "nope"); e6_refuse("a block without open tasks", r, "scout", "open")
+    # dry-run changes nothing and names the tasks
+    r, ts = e6_run("e6dry", "scout", lanes); before = e6_snap(r)
+    rc, out, err = e2_out(cli.cmd_refresh_inputs, argparse.Namespace(run=str(r.root), block="scout", dry_run=True))
+    check(rc == 0 and all(t in out for t in ts) and e6_snap(r) == before, "E6: --dry-run lists the tasks that would be replaced and changes nothing")
+    # zero-task re-expansion refuses
+    ref = {}
+    r, ts = e6_run("e6zero", "extract-single", seed=lambda r: ref.update(s1=source(r, "abcdefghijk first source with enough characters to pass", "og1")[2]))
+    ingest.drop_source(r, ref["s1"]); before = e6_snap(r)
+    msg = e2_dies(runtime.refresh_inputs, r, "extract-single")
+    check(msg is not None and "no task" in msg and e6_snap(r) == before, "E6: a re-expansion that would create no task refuses and changes nothing")
+e2_case(e6_refusals)
+
+def e6_failure():
+    r, olds = e6_run("e6fail", "collect", bparams={"batch": 2}, seed=lambda r: e6_cand(r, 3))
+    e6_cand(r, 3); before = e6_snap(r); orig = runtime.make_task; calls = []
+    def boom(*a, **k):
+        calls.append(1)
+        if len(calls) == 2: raise RuntimeError("injected")
+        return orig(*a, **k)
+    runtime.make_task = boom
+    try:
+        try:
+            runtime.refresh_inputs(r, "collect"); raised = False
+        except RuntimeError:
+            raised = True
+    finally:
+        runtime.make_task = orig
+    after = e6_snap(r)
+    check(raised and len(calls) == 2 and after == before, "E6: a failure inside expand_block restores rows, files, directories and candidate assignments exactly")
+    check(sorted(runtime.refresh_inputs(r, "collect")[0]) == sorted(olds), "E6: the run is usable after the rolled-back attempt")
+e2_case(e6_failure)
+
+# 32 E6: refresh-inputs must never recreate work that already exists in the same wave (per_lane has no dedupe of its own)
+lanes3 = {"lanes": [{"name": "a", "desc": "x"}, {"name": "b", "desc": "y"}, {"name": "c", "desc": "z"}]}
+r, ts = e6_run("e6dup1", "scout", lanes3)
+r.db.execute("UPDATE tasks SET status='verified', verified='x' WHERE id=?", (ts[0],))
+msg = e6_refuse("a wave whose sibling lane task is already verified (would recreate that lane)", r, "scout", "already exists")
+check(msg and "a@1" in msg and "b@1" not in msg.split("fanout keys")[1].split(")")[0], "E6: the refusal names exactly the lane that would be duplicated")
+r, ts = e6_run("e6dup2", "scout", lanes3)
+r.db.execute("UPDATE tasks SET status='failed' WHERE id=?", (ts[1],))
+e6_refuse("a wave whose sibling lane task failed (retry it instead)", r, "scout", "already exists")
+r, ts = e6_run("e6dup3", "scout", lanes3)
+old, new = runtime.refresh_inputs(r, "scout")
+check(sorted(old) == sorted(ts) and len(new) == 3 and sorted(x["fanout_key"] for x in r.q("SELECT fanout_key FROM tasks")) == ["a@1", "b@1", "c@1"], "E6: refreshing a wave where every task is still planned keeps working (control)")
+
 shutil.rmtree(BASE, ignore_errors=True)
 print("UNIT PASS" if all(RESULTS) else f"UNIT FAIL ({RESULTS.count(False)} of {len(RESULTS)})")
 sys.exit(0 if all(RESULTS) else 1)
