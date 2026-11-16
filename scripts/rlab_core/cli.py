@@ -315,6 +315,16 @@ def cmd_unready(a):
     return 0
 
 
+def cmd_refresh_inputs(a):
+    run = _run(a)
+    old, new = runtime.refresh_inputs(run, a.block, a.dry_run)
+    if a.dry_run:
+        print(f"dry run: would replace {', '.join(old)} (block {a.block}); nothing changed")
+    else:
+        print(f"inputs refreshed (block {a.block}): {', '.join(old)} -> {', '.join(new)}")
+    return 0
+
+
 def cmd_resume(a):
     run = _run(a)
     runtime.resume(run, a.reason)
@@ -581,6 +591,8 @@ def build_parser():
     s = sub.add_parser("downgrade", parents=[common], help="(parent) lower a claim's strength; reason required")
     s.add_argument("--claim", required=True); s.add_argument("--strength", required=True); s.add_argument("--reason", required=True); s.set_defaults(fn=cmd_downgrade)
     s = sub.add_parser("reopen", parents=[common], help="force another wave of a block"); s.add_argument("--block", required=True); s.add_argument("--note"); s.set_defaults(fn=cmd_reopen)
+    s = sub.add_parser("refresh-inputs", parents=[common], help="rebuild the input snapshots of a block whose tasks were never started (cancel + re-expand)")
+    s.add_argument("--block", required=True); s.add_argument("--dry-run", action="store_true"); s.set_defaults(fn=cmd_refresh_inputs)
     s = sub.add_parser("resolve", parents=[common], help="resolve/disclose a contradiction")
     s.add_argument("--id", help="single mode: contradiction id (e.g. X0001)"); s.add_argument("--status", help="single mode: resolved|disclosed"); s.add_argument("--note", help="single mode: reason")
     s.add_argument("--file", help='batch mode: JSONL, one {"id":"X0001","status":"resolved|disclosed","note":"..."} per line; exclusive with --id/--status/--note; all-or-nothing')

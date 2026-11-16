@@ -238,8 +238,13 @@ def parent_actions(res):
             R("done", "--run", RUN, "--block", b)
 
 
+(RUNDIR / "addendum.md").write_text("수집 경계: 공개 자료만 사용(테스트 부록).\n", encoding="utf-8")
+add_seen = False
 for rnd in range(60):
     nxt = json.loads(R("next", "--run", RUN, "--dispatch", "--json"))
+    if nxt["dispatch"] and not add_seen:  # E6: the run-level addendum reaches the first emitted payload without any manual step
+        add_seen = True
+        check(all(str((RUNDIR / "addendum.md").resolve()) in t["context"] and "take precedence" in t["context"] and t["context"].isascii() for t in nxt["dispatch"]), "E6: addendum.md path is in every first-round context and the payload stays ASCII")
     if rnd == 0:
         check(bool(nxt["dispatch"]) or bool(nxt["parent"]), "first next yields work")
     if nxt["done"] or (not nxt["dispatch"] and not nxt["parent"] and not nxt["inflight"] and not nxt["blocked"]):
