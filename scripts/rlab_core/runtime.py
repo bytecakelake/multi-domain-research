@@ -519,13 +519,29 @@ def next_actions(run: Run, max_dispatch=None, dispatch=False, available=None) ->
     notes = advance(run)
     spec_blocks = run.spec["blocks"]
     inflight = [dict(t) for t in run.q("SELECT * FROM tasks WHERE manual=0 AND status IN ('dispatched','returned') ORDER BY id")]
-    cap = (max_dispatch if max_dispatch is not None else run.params().get("max_parallel", 4)) - len(inflight)
+    slots = (max_dispatch if max_dispatch is not None else run.params().get("max_parallel", 4)) - len(inflight)
+    max_per_option = run.params().get("max_per_option", 3)
+    halt_raw = run.meta("halt")
+    halted = json.loads(halt_raw) if halt_raw else None
     planned = [dict(t) for t in run.q("SELECT * FROM tasks WHERE manual=0 AND status='planned' ORDER BY id")]
-    ready = planned[:max(0, cap)]
-    payload = []
-    for t in ready:
-        b = run.block(t["block"])
+    load: dict = {}
+    for t in inflight:
+        if t["option"]:
+            load[t["option"]] = load.get(t["option"], 0) + 1
+    ready, capped = [], []
+    for t in ([] if halted else planned):
+        if len(ready) >= slots:
+            break
         opt, onote = pick_option(t["role"], t["coder"], available)
+        if opt and load.get(opt, 0) >= max_per_option:
+            capped.append({"task_id": t["id"], "option": opt, "cap": max_per_option})
+            continue
+        if opt:
+            load[opt] = load.get(opt, 0) + 1
+        ready.append((t, opt, onote))
+    payload = []
+    for t, opt, onote in ready:
+        b = run.block(t["block"])
         contract = run.p("tasks", t["id"], "contract.md")
         payload.append({"task_id": t["id"], "block": t["block"], "role": t["role"], "coder": t["coder"], "option": opt, "option_note": onote,
                         "goal": f"{b.get('goal') or b['purpose']} — 계약서 {contract} 를 처음부터 끝까지 읽고 그대로 수행하십시오.",
@@ -561,7 +577,7 @@ def next_actions(run: Run, max_dispatch=None, dispatch=False, available=None) ->
         run.bump()
     return {"phase": phase, "done": done, "dispatch": payload, "payload_path": str(payload_path) if payload_path else None, "parent": parent,
             "inflight": [{"task_id": t["id"], "block": t["block"], "role": t["role"], "coder": t["coder"], "status": t["status"], "option": t["option"]} for t in inflight],
-            "queued": len(planned) - len(ready), "blocked": blocked, "notes": notes,
+            "queued": len(planned) - len(ready), "capped": capped, "halted": halted, "blocked": blocked, "notes": notes,
             "blocks": {"complete": sum(bstate(run, b["id"])["status"] == "complete" for b in spec_blocks), "total": len(spec_blocks)}}
 
 
@@ -587,7 +603,48 @@ def done_block(run: Run, bid: str, note=None) -> int:
     return n
 
 
-def retry_task(run: Run, tid: str, option=None, note=None) -> None:
+CAUSES = ("env", "contract", "model")
+
+
+def _http(*codes: str) -> str:
+    return rf"(?<!\w)(?:http(?:/\d(?:\.\d)?)?|status|error|code)[\s:=_#-]*(?:code[\s:=]*)?(?:{'|'.join(codes)})(?!\w)"
+
+
+# (class, kind) -> patterns; deliberately narrow: a bare number like "402 rows" must never match
+_OUTPUT_PATTERNS = [
+    ("proof", r"\A\s*proof:|\bPROOF FAILED\b"),
+    ("rejected", r"\brejected\b|\bquote not found\b|\bnot found verbatim\b|\bunknown evidence id\b|\bmissing _meta\b|\bn_rows\b"),
+]
+_ENV_PATTERNS = [
+    ("billing", _http("402") + r"|(?<![\w.])402\s+payment required\b|\bpayment required\b|\bbilling[\s_-]+(?:hard[\s_-]+)?(?:error|limit|issue|required)\b|\bcredits?\s+(?:exhausted|depleted|exceeded)\b|\binsufficient[\s_-]+(?:credits?|quota|balance|funds)\b"),
+    ("rate_limit", _http("429") + r"|(?<![\w.])429\s+too many requests\b|\bnew-account-rpm\b|\brate[\s_-]?limit|\busage limit\b[^\n]*\bresets?\b"),
+    ("auth", _http("401") + r"|(?<![\w.])401\s+unauthorized\b|\binvalidated oauth token\b|\boauth token\b[^\n]*\binvalidated\b|\bunauthorized\b"),
+    ("network", _http("500", "502", "503", "504") + r"|\btimeout\b|\btimed out\b|\bconnection (?:reset|refused)\b"),
+]
+_OUTPUT_RX = [(k, re.compile(p, re.I)) for k, p in _OUTPUT_PATTERNS]
+_ENV_RX = [(k, re.compile(p, re.I)) for k, p in _ENV_PATTERNS]
+
+
+def classify_failure(text) -> tuple[str, str | None, str]:
+    """Pattern-only failure class: ('env'|'output'|'unknown', kind, source). Never guesses.
+
+    Ingest outcome texts are checked first so an env word quoted inside a rejected quote cannot look like an outage.
+    """
+    text = (text or "").strip()
+    if not text:
+        return "unknown", None, "none"
+    for kind, rx in _OUTPUT_RX:
+        if rx.search(text):
+            return "output", kind, "pattern"
+    for kind, rx in _ENV_RX:
+        if rx.search(text):
+            return "env", kind, "pattern"
+    return "unknown", None, "none"
+
+
+def retry_task(run: Run, tid: str, option=None, note=None, cause=None) -> None:
+    if cause is not None and cause not in CAUSES:
+        die(f"invalid --cause {cause!r}: use one of {', '.join(CAUSES)}")
     t = run.one("SELECT * FROM tasks WHERE id=?", (tid,))
     if not t:
         die(f"unknown task: {tid}")
@@ -595,15 +652,53 @@ def retry_task(run: Run, tid: str, option=None, note=None) -> None:
         die("verified tasks cannot be retried")
     note = (note or "").strip()
     auto = not note
+    prior = (t["notes"] or "").strip()
     if auto:  # never invent a cause: only restate what the ledger already recorded
-        prior = (t["notes"] or "").strip()
         note = f"auto: retried after status={t['status']}, attempt {t['attempts']}; " + (f"prior note: {prior}" if prior else "no prior note recorded")
+    cls, kind, source = classify_failure(prior if auto else note)
+    if cause:  # explicit operator decision wins; a pattern kind is only meaningful for env
+        cls, kind, source = cause, (kind if cause == "env" and cls == "env" else None), "explicit"
+    if source != "none":
+        note = f"[{cls}:{kind}] {note}" if kind else f"[{cls}] {note}"
     run.db.execute("UPDATE tasks SET status='planned', attempts=attempts+1, notes=?, option=COALESCE(?,option), receipt=?, begun=NULL WHERE id=?",
                    (note, option, _receipt(run, tid, t["input_sha"], t["attempts"] + 1), tid))
     out = run.p("staging", "out", f"{tid}.jsonl")
     if out.exists():
         out.rename(out.with_suffix(f".attempt{t['attempts']}.jsonl"))
-    run.event("retry", tid, note=note, option=option, auto=auto)
+    run.event("retry", tid, note=note, option=option, auto=auto, failure_class=cls, failure_kind=kind, class_source=source)
+    if (cls, kind) == ("env", "billing"):
+        _maybe_halt_billing(run, t["block"], t["wave"])
+
+
+def _maybe_halt_billing(run: Run, block: str, wave: int) -> None:
+    """Halt dispatch when every dispatched, unfinished task of (block, wave) last failed with billing on one option.
+
+    Tasks never dispatched (e.g. held back by max_per_option) have no option or retry event yet and are not part of the group.
+    """
+    if run.meta("halt"):
+        return
+    group = run.q("SELECT id, option FROM tasks WHERE manual=0 AND block=? AND wave=? AND status!='verified' AND dispatched IS NOT NULL ORDER BY id", (block, wave))
+    if len(group) < 2 or len({g["option"] for g in group}) != 1:
+        return
+    for g in group:
+        last = run.one("SELECT detail FROM events WHERE kind='retry' AND task_id=? ORDER BY id DESC LIMIT 1", (g["id"],))
+        d = json.loads(last["detail"]) if last and last["detail"] else {}
+        if (d.get("failure_class"), d.get("failure_kind")) != ("env", "billing"):
+            return
+    halt = {"kind": "billing", "block": block, "wave": wave, "option": group[0]["option"], "tasks": [g["id"] for g in group], "ts": now()}
+    run.set_meta("halt", json.dumps(halt, ensure_ascii=False))
+    run.event("halt", None, halt=halt)
+
+
+def resume(run: Run, reason) -> None:
+    reason = (reason or "").strip()
+    if not reason:
+        die("resume requires --reason")
+    halt = run.meta("halt")
+    if not halt:
+        die("no active halt to resume")
+    run.db.execute("DELETE FROM meta WHERE k='halt'")
+    run.event("resume", None, reason=reason, halt=json.loads(halt))
 
 
 # ---------------------------------------------------------------- status / report / retro

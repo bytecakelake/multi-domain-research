@@ -218,7 +218,7 @@ r = setup("retryreason", ["scout"]); t = task(r, "scout", None)
 runtime.begin_task(r, t); r.db.execute("UPDATE tasks SET status='failed', notes=? WHERE id=?", ("HTTP 429 new-account-rpm", t))
 runtime.retry_task(r, t)
 n1 = r.one("SELECT notes n, attempts a FROM tasks WHERE id=?", (t,))
-check(n1["n"] and "failed" in n1["n"] and "HTTP 429 new-account-rpm" in n1["n"] and n1["n"].startswith("auto:"), "blank retry records automatic reason from prior status/notes")
+check(n1["n"] and "failed" in n1["n"] and "HTTP 429 new-account-rpm" in n1["n"] and "auto: retried" in n1["n"], "blank retry records automatic reason from prior status/notes")
 ev1 = json.loads(r.one("SELECT detail d FROM events WHERE kind='retry' ORDER BY id DESC")["d"])
 check(ev1.get("auto") is True and ev1.get("note") == n1["n"], "retry event flags the reason as automatic")
 r.db.execute("UPDATE tasks SET status='failed', notes=NULL WHERE id=?", (t,))
@@ -452,6 +452,211 @@ t0 = time.time(); cli.cmd_resolve(e9_ns(file=fbig)); dt = time.time() - t0
 print(f"E9 300-row batch took {dt:.2f}s")
 check(dt < 30 and cnt(core.Run(r.root), "SELECT COUNT(*) n FROM contradictions WHERE status='open'") == 5, "E9 300-row batch under 30s, all 300 applied")
 check(core.Run(r.root).one("SELECT COUNT(*) n FROM events WHERE kind='contradiction_resolved'")["n"] == 3 + 1 + 300, "E9 300-row batch wrote 300 events")
+
+# 23 E3: classify_failure is a pure, high-confidence pattern table (env vs output vs unknown)
+CF = runtime.classify_failure
+for txt, want in [("HTTP 402 Payment Required", ("env", "billing")), ("billing hard limit reached", ("env", "billing")), ("credits exhausted", ("env", "billing")),
+                  ("insufficient credits on account", ("env", "billing")), ("insufficient_quota", ("env", "billing")),
+                  ("HTTP 429 new-account-rpm", ("env", "rate_limit")), ("Rate limit reached for model", ("env", "rate_limit")),
+                  ("You have hit your usage limit. It resets at 5pm", ("env", "rate_limit")),
+                  ("HTTP 401 Unauthorized", ("env", "auth")), ("OAuth token has been invalidated", ("env", "auth")), ("unauthorized", ("env", "auth")),
+                  ("request timed out after 60s", ("env", "network")), ("Timeout while reading", ("env", "network")), ("connection reset by peer", ("env", "network")),
+                  ("Connection refused", ("env", "network")), ("HTTP 503 service unavailable", ("env", "network")), ("upstream returned HTTP 502", ("env", "network")),
+                  ("proof: output file truncated", ("output", "proof")), ("PROOF FAILED: no receipt", ("output", "proof")),
+                  ("rejected 3 of 10 rows", ("output", "rejected")), ("quote not found verbatim", ("output", "rejected")), ("unknown evidence id E9", ("output", "rejected")),
+                  ("missing _meta line", ("output", "rejected")), ("n_rows mismatch", ("output", "rejected"))]:
+    check(CF(txt)[:2] == want and CF(txt)[2] == "pattern", f"classify_failure({txt!r}) -> {want}")
+for txt in ["HTTP 4020", "ID 14029 not valid", "found 402 rows", "error 40290", "port 5029", "the model refused", "something odd", "HTTP 4290"]:
+    check(CF(txt) == ("unknown", None, "none"), f"classify_failure near-miss {txt!r} stays unknown")
+check(CF("") == ("unknown", None, "none") and CF(None) == ("unknown", None, "none") and CF("   ") == ("unknown", None, "none"), "classify_failure empty/None/blank -> unknown")
+check(CF("요청 실패: HTTP 429 — 사용량 초과 😀")[:2] == ("env", "rate_limit"), "classify_failure finds HTTP 429 inside unicode text")
+check(CF("http 402")[:2] == ("env", "billing") and CF("RATE LIMIT")[:2] == ("env", "rate_limit"), "classify_failure is case-insensitive")
+check(CF("proof: quote not found, then HTTP 402 in quoted text")[:2] == ("output", "proof"), "ingest outcome text wins over an env word quoted inside it")
+
+# 24 E3: retry stores class/kind/source, tags only known classes, explicit --cause wins, auto reason classifies from prior notes
+def e3_ev(r, n=1):
+    return json.loads(r.q("SELECT detail d FROM events WHERE kind='retry' ORDER BY id DESC")[n - 1]["d"])
+def e3_fail(r, t, notes=None, status="failed"):
+    r.db.execute("UPDATE tasks SET status=?, notes=? WHERE id=?", (status, notes, t))
+def e3_note(r, t):
+    return r.one("SELECT notes n FROM tasks WHERE id=?", (t,))["n"]
+r = setup("e3cls", ["scout"]); t = task(r, "scout", None)
+e3_fail(r, t); runtime.retry_task(r, t, note="HTTP 402 credits exhausted")
+e = e3_ev(r)
+check((e["failure_class"], e["failure_kind"], e["class_source"]) == ("env", "billing", "pattern") and e["note"] == e3_note(r, t), "retry event stores class/kind/source=pattern")
+check(e3_note(r, t) == "[env:billing] HTTP 402 credits exhausted", "known class prefixes a tag and keeps explicit note text verbatim")
+e3_fail(r, t); runtime.retry_task(r, t, note="the model gave up")
+e = e3_ev(r)
+check((e["failure_class"], e["failure_kind"], e["class_source"]) == ("unknown", None, "none") and e3_note(r, t) == "the model gave up", "unknown class: stored with source none and no tag")
+e3_fail(r, t); runtime.retry_task(r, t, note="HTTP 429 rate limit", cause="model")
+e = e3_ev(r)
+check((e["failure_class"], e["class_source"]) == ("model", "explicit") and e3_note(r, t) == "[model] HTTP 429 rate limit", "explicit --cause model wins over pattern")
+e3_fail(r, t); runtime.retry_task(r, t, note="weird", cause="contract")
+check(e3_ev(r)["failure_class"] == "contract" and e3_ev(r)["class_source"] == "explicit" and e3_note(r, t) == "[contract] weird", "explicit --cause contract on unknown text")
+e3_fail(r, t); runtime.retry_task(r, t, note="HTTP 402", cause="env")
+e = e3_ev(r)
+check((e["failure_class"], e["failure_kind"], e["class_source"]) == ("env", "billing", "explicit") and e3_note(r, t) == "[env:billing] HTTP 402", "explicit --cause env keeps pattern kind")
+e3_fail(r, t); runtime.retry_task(r, t, note="odd", cause="env")
+check(e3_ev(r)["failure_kind"] is None and e3_note(r, t) == "[env] odd", "explicit env without recognisable kind: tag has no kind")
+before = (e3_note(r, t), r.one("SELECT attempts a FROM tasks WHERE id=?", (t,))["a"], len(r.q("SELECT 1 FROM events WHERE kind='retry'")))
+try:
+    runtime.retry_task(r, t, note="x", cause="banana"); bad = False
+except core.RlabError:
+    bad = True
+check(bad and before == (e3_note(r, t), r.one("SELECT attempts a FROM tasks WHERE id=?", (t,))["a"], len(r.q("SELECT 1 FROM events WHERE kind='retry'"))), "invalid cause dies without touching the task or events")
+e3_fail(r, t, "HTTP 402 billing"); runtime.retry_task(r, t)
+e = e3_ev(r); n = e3_note(r, t)
+check(e["auto"] is True and (e["failure_class"], e["failure_kind"], e["class_source"]) == ("env", "billing", "pattern") and n.startswith("[env:billing] auto:") and "HTTP 402 billing" in n, "auto-reason retry classifies from prior notes")
+e3_fail(r, t, None); runtime.retry_task(r, t)
+e = e3_ev(r)
+check(e["auto"] is True and e["failure_class"] == "unknown" and e["class_source"] == "none" and e3_note(r, t).startswith("auto:"), "auto retry with no prior note: unknown, no tag")
+e3_fail(r, t, "HTTP 402 billing"); runtime.retry_task(r, t, note="switched provider")
+check(e3_ev(r)["failure_class"] == "unknown" and e3_note(r, t) == "switched provider", "an explicit note is classified on its own text, not on prior notes")
+
+# 25 E3: per-option concurrency cap in next_actions
+def e3_state(r):
+    return {x["id"]: x["status"] for x in r.q("SELECT id, status FROM tasks")}
+r = setup("e3cap", ["scout", "analyze-claims"], {"max_parallel": 10})
+ts = [task(r, "scout", None) for _ in range(5)]
+res = runtime.next_actions(r)
+check(len(res["dispatch"]) == 3 and all(p["option"] == "M-Terra-Quick" for p in res["dispatch"]), "cap: 5 planned on one option, default cap 3 -> 3 emitted")
+check(res["capped"] == [{"task_id": x, "option": "M-Terra-Quick", "cap": 3} for x in ts[3:]] and res["queued"] == 2, "cap: the other 2 are reported as capped and remain queued")
+check(set(e3_state(r).values()) == {"planned"}, "cap: dry run dispatches nothing")
+res = runtime.next_actions(r, dispatch=True)
+st = e3_state(r)
+check([st[x] for x in ts] == ["dispatched"] * 3 + ["planned"] * 2, "cap: dispatch marks only the 3 uncapped tasks")
+res = runtime.next_actions(r)
+check(res["dispatch"] == [] and [c["task_id"] for c in res["capped"]] == ts[3:], "cap: in-flight tasks count toward the option cap")
+r.db.execute("UPDATE tasks SET status='returned' WHERE id=?", (ts[0],))
+check(runtime.next_actions(r)["dispatch"] == [], "cap: returned tasks still count as in-flight")
+r.db.execute("UPDATE tasks SET status='verified' WHERE id=?", (ts[0],))
+res = runtime.next_actions(r)
+check([p["task_id"] for p in res["dispatch"]] == [ts[3]] and [c["task_id"] for c in res["capped"]] == [ts[4]], "cap: a freed slot lets exactly one waiting task through")
+a1 = task(r, "analyze-claims", None)
+res = runtime.next_actions(r)
+check(a1 in [p["task_id"] for p in res["dispatch"]] and all(c["option"] == "M-Terra-Quick" for c in res["capped"]), "cap: a different option is not blocked by a full option")
+r2 = setup("e3cap2", ["scout"], {"max_parallel": 10, "max_per_option": 1})
+for _ in range(3): task(r2, "scout", None)
+res = runtime.next_actions(r2)
+check(len(res["dispatch"]) == 1 and len(res["capped"]) == 2 and res["capped"][0]["cap"] == 1, "cap: params.max_per_option overrides the default")
+r3 = setup("e3cap3", ["scout"], {"max_parallel": 10})
+for _ in range(5): task(r3, "scout", None)
+res = runtime.next_actions(r3, available=[])
+check(len(res["dispatch"]) == 5 and all(p["option"] is None for p in res["dispatch"]) and res["capped"] == [], "cap: tasks with option None are not option-capped")
+r4 = setup("e3cap4", ["scout"], {"max_parallel": 2})
+for _ in range(5): task(r4, "scout", None)
+res = runtime.next_actions(r4)
+check(len(res["dispatch"]) == 2 and res["capped"] == [] and res["queued"] == 3, "cap: max_parallel still limits the total (2 < option cap 3)")
+r5 = setup("e3cap5", ["scout", "analyze-claims"], {"max_parallel": 4})
+for _ in range(4): task(r5, "scout", None)
+task(r5, "analyze-claims", None)
+res = runtime.next_actions(r5)
+check(len(res["dispatch"]) == 4 and [c["task_id"] for c in res["capped"]] == ["T0004"] and res["queued"] == 1, "cap: a capped task does not waste a parallel slot (3 scouts + the analyst fill 4 slots)")
+
+# 26 E3: billing auto-halt and resume
+def e3_halt_run(case, n=2, wave=1, opt="M-Terra-Quick"):
+    r = setup(case, ["scout", "analyze-claims"], {"max_parallel": 10})
+    ts = [task(r, "scout", None, wave=wave) for _ in range(n)]
+    for t in ts:
+        r.db.execute("UPDATE tasks SET status='failed', option=?, dispatched='2026-01-01T00:00:00' WHERE id=?", (opt, t))
+    return r, ts
+def e3_halt(r):
+    v = r.meta("halt")
+    return json.loads(v) if v else None
+r, ts = e3_halt_run("e3h1")
+runtime.retry_task(r, ts[0], note="HTTP 402 payment required")
+check(e3_halt(r) is None, "halt: one 402 in a two-task wave does not halt yet")
+runtime.retry_task(r, ts[1], note="HTTP 402 payment required")
+h = e3_halt(r)
+check(h and h["kind"] == "billing" and h["block"] == "scout" and h["wave"] == 1 and h["option"] == "M-Terra-Quick" and sorted(h["tasks"]) == sorted(ts) and h["ts"], "halt: all non-verified tasks of the wave failed with 402 on one option -> halt object in meta")
+res = runtime.next_actions(r, dispatch=True)
+check(res["dispatch"] == [] and res["payload_path"] is None and res["halted"] == h and set(e3_state(r).values()) == {"planned"}, "halt: next emits nothing, dispatches nothing and reports halted")
+check([json.loads(x["d"])["halt"] for x in r.q("SELECT detail d FROM events WHERE kind='halt'")] == [h], "halt: recorded as an event")
+try:
+    runtime.resume(r, ""); bad = False
+except core.RlabError:
+    bad = True
+check(bad and e3_halt(r) == h, "resume: empty reason dies and keeps the halt")
+runtime.resume(r, "topped up credits")
+ev_r = [json.loads(x["d"]) for x in r.q("SELECT detail d FROM events WHERE kind='resume'")]
+check(e3_halt(r) is None and len(ev_r) == 1 and ev_r[0]["reason"] == "topped up credits" and ev_r[0]["halt"] == h, "resume: clears the halt and records a resume event with reason and the cleared halt")
+res = runtime.next_actions(r, dispatch=True)
+check(len(res["dispatch"]) == 2 and not res.get("halted"), "resume: dispatch works again")
+try:
+    runtime.resume(r, "again"); bad = False
+except core.RlabError as ex:
+    bad = "no active halt" in str(ex)
+check(bad, "resume without an active halt dies with a clear message")
+r, ts = e3_halt_run("e3h2", n=1)
+runtime.retry_task(r, ts[0], note="HTTP 402")
+check(e3_halt(r) is None and runtime.next_actions(r).get("halted") is None, "halt: a single failed task never halts")
+r, ts = e3_halt_run("e3h3")
+r.db.execute("UPDATE tasks SET option='M-Haiku-Quick' WHERE id=?", (ts[1],))
+runtime.retry_task(r, ts[0], note="HTTP 402"); runtime.retry_task(r, ts[1], note="HTTP 402", option="M-Haiku-Quick")
+check(e3_halt(r) is None, "halt: 402 on different options does not halt")
+for code, case in [("HTTP 429 rate limit", "e3h4"), ("HTTP 401 unauthorized", "e3h5"), ("connection reset", "e3h6")]:
+    r, ts = e3_halt_run(case)
+    for t in ts: runtime.retry_task(r, t, note=code)
+    check(e3_halt(r) is None and runtime.next_actions(r).get("halted") is None, f"halt: {code!r} on every task never halts")
+r, ts = e3_halt_run("e3h7", n=3)
+r.db.execute("UPDATE tasks SET status='verified' WHERE id=?", (ts[2],))
+runtime.retry_task(r, ts[0], note="HTTP 402"); runtime.retry_task(r, ts[1], note="HTTP 402")
+check(e3_halt(r) is not None and ts[2] not in e3_halt(r)["tasks"], "halt: verified tasks of the wave are ignored")
+r, ts = e3_halt_run("e3h8")
+r.db.execute("UPDATE tasks SET status='planned' WHERE id=?", (ts[1],))
+runtime.retry_task(r, ts[0], note="HTTP 402")
+check(e3_halt(r) is None, "halt: a sibling that never failed with 402 (no retry event) blocks the halt")
+r, ts = e3_halt_run("e3h9")
+runtime.retry_task(r, ts[0], note="HTTP 402"); e3_fail(r, ts[0]); runtime.retry_task(r, ts[0], note="model returned junk"); runtime.retry_task(r, ts[1], note="HTTP 402")
+check(e3_halt(r) is None, "halt: only the LATEST retry event of each task counts")
+r, ts = e3_halt_run("e3h10", n=1)
+other = task(r, "scout", None, wave=2); r.db.execute("UPDATE tasks SET status='failed', option='M-Terra-Quick' WHERE id=?", (other,))
+third = task(r, "analyze-claims", None, wave=1); r.db.execute("UPDATE tasks SET status='failed', option='M-Terra-Quick' WHERE id=?", (third,))
+runtime.retry_task(r, ts[0], note="HTTP 402"); runtime.retry_task(r, other, note="HTTP 402"); runtime.retry_task(r, third, note="HTTP 402")
+check(e3_halt(r) is None, "halt: tasks of another wave or block do not count toward the group")
+r, ts = e3_halt_run("e3h11")
+runtime.retry_task(r, ts[0], note="HTTP 402"); runtime.retry_task(r, ts[1], note="billing issue", cause="env")
+check(e3_halt(r) is not None, "halt: explicit --cause env with a billing note halts too")
+r, ts = e3_halt_run("e3h12")
+runtime.retry_task(r, ts[0], note="HTTP 402"); runtime.retry_task(r, ts[1], note="HTTP 402", cause="model")
+check(e3_halt(r) is None, "halt: explicit --cause model overrides the 402 pattern and does not halt")
+
+# halt ignores tasks that were never dispatched (capped by max_per_option): they have no option and no retry event yet
+r, ts = e3_halt_run("e3h13")
+waiting = [task(r, "scout", None) for _ in range(2)]
+runtime.retry_task(r, ts[0], note="HTTP 402"); runtime.retry_task(r, ts[1], note="HTTP 402")
+h = e3_halt(r)
+check(h is not None and sorted(h["tasks"]) == sorted(ts) and all(w not in h["tasks"] for w in waiting), "halt: never-dispatched (capped) siblings of the wave do not block the halt")
+for txt in ["billing dispute policy not found", "the billing page lists no fee", "billing"]:
+    check(CF(txt) == ("unknown", None, "none"), f"classify_failure: bare word in {txt!r} is not a billing outage")
+check(CF("billing error: card declined")[:2] == ("env", "billing") and CF("billing hard limit reached")[:2] == ("env", "billing"), "classify_failure: billing error/limit phrases still classify as billing")
+
+# 27 E3: CLI surface (retry --cause, resume, printed halt/capped blocks)
+import io, contextlib
+r, ts = e3_halt_run("e3cli")
+ns = argparse.Namespace(run=str(r.root), task=ts[0], option=None, note="HTTP 402", cause="env")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    cli.cmd_retry(ns); ns2 = argparse.Namespace(run=str(r.root), task=ts[1], option=None, note="HTTP 402", cause=None); cli.cmd_retry(ns2)
+    res = runtime.next_actions(core.Run(r.root)); cli._print_next(res, False)
+out = buf.getvalue()
+check("[HALT]" in out and "rlab resume --reason" in out and "402" in out and "top" in out.lower(), "CLI prints a [HALT] block with the resume command")
+with contextlib.redirect_stdout(io.StringIO()):
+    rc = cli.cmd_resume(argparse.Namespace(run=str(r.root), reason="topped up"))
+check(rc == 0, "CLI resume returns 0")
+r = core.Run(r.root)
+check(r.meta("halt") is None, "CLI resume cleared the halt")
+r = setup("e3cli2", ["scout"], {"max_parallel": 10})
+for _ in range(4): task(r, "scout", None)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    res = runtime.next_actions(r)
+    for p in res["dispatch"]: p["pointer"] = "ptr"
+    cli._print_next(res, False)
+check("wait" in buf.getvalue().lower() and "M-Terra-Quick" in buf.getvalue() and "3" in buf.getvalue(), "CLI prints which tasks wait for a free option slot")
+import subprocess as _sp
+helptxt = _sp.run([sys.executable, str(Path(__file__).resolve().parent / "rlab.py"), "retry", "--help"], capture_output=True, text=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}).stdout
+check("--cause" in helptxt and "env,contract,model" in helptxt.replace("{", "").replace("}", "").replace(" ", ""), "retry --cause offers env|contract|model choices")
 
 shutil.rmtree(BASE, ignore_errors=True)
 print("UNIT PASS" if all(RESULTS) else f"UNIT FAIL ({RESULTS.count(False)} of {len(RESULTS)})")

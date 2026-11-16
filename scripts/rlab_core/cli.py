@@ -188,6 +188,15 @@ def _print_next(res, as_json):
     print(f"PHASE: {res['phase']}   blocks {b['complete']}/{b['total']} complete" + ("   *** ALL DONE ***" if res["done"] else ""))
     for n in res["notes"]:
         print("  note:", n)
+    h = res["halted"]
+    if h:
+        print(f"\n[HALT] dispatch stopped: every unfinished task of {h['block']} wave {h['wave']} ({', '.join(h['tasks'])}) failed with a billing error (HTTP 402) on option {h['option']} (since {h['ts']}).")
+        print("  This is an environment failure, not a model failure. Switching to another model of the same provider usually does not help for 402;")
+        print("  the user must choose: top up the account, or route to another provider (retry --option ...).")
+        print('  When resolved: rlab resume --reason "..."')
+    if res["capped"]:
+        print(f"\n[WAITING FOR SLOT] {len(res['capped'])} task(s) wait for a free slot on their option (per-option cap, params.max_per_option):")
+        print(table([(c["task_id"], c["option"], c["cap"]) for c in res["capped"]], ["task", "option", "cap"]))
     if res["dispatch"]:
         print(f"\n[DISPATCH] {len(res['dispatch'])} task(s) ready (queued behind them: {res['queued']})")
         print(table([(p["task_id"], p["block"], p["role"] + ("." + p["coder"] if p["coder"] else ""), p["option"], p["option_note"]) for p in res["dispatch"]], ["task", "block", "role", "option", "option note"]))
@@ -270,8 +279,17 @@ def cmd_done(a):
 
 def cmd_retry(a):
     run = _run(a)
-    runtime.retry_task(run, a.task, a.option, a.note)
+    runtime.retry_task(run, a.task, a.option, a.note, a.cause)
     print(f"{a.task} reset to planned (attempts+1). Re-run `rlab next --dispatch`.")
+    if run.meta("halt"):
+        print("[HALT] billing halt is active: `rlab next` will not dispatch until `rlab resume --reason \"...\"`.")
+    return 0
+
+
+def cmd_resume(a):
+    run = _run(a)
+    runtime.resume(run, a.reason)
+    print("halt cleared. Re-run `rlab next --dispatch`.")
     return 0
 
 
@@ -521,7 +539,8 @@ def build_parser():
     s.set_defaults(fn=cmd_load)
 
     s = sub.add_parser("done", parents=[common], help="mark a parent block's manual task done"); s.add_argument("--block", required=True); s.add_argument("--note"); s.set_defaults(fn=cmd_done)
-    s = sub.add_parser("retry", parents=[common], help="reset a failed task"); s.add_argument("--task", required=True); s.add_argument("--option"); s.add_argument("--note"); s.set_defaults(fn=cmd_retry)
+    s = sub.add_parser("retry", parents=[common], help="reset a failed task"); s.add_argument("--task", required=True); s.add_argument("--option"); s.add_argument("--note"); s.add_argument("--cause", choices=runtime.CAUSES, help="explicit failure class (overrides pattern classification)"); s.set_defaults(fn=cmd_retry)
+    s = sub.add_parser("resume", parents=[common], help="clear an automatic halt (billing) after the user decided"); s.add_argument("--reason", required=True); s.set_defaults(fn=cmd_resume)
     s = sub.add_parser("waive", parents=[common], help="waive a failing gate (recorded as limitation)")
     s.add_argument("--gate", required=True); s.add_argument("--block"); s.add_argument("--reason", required=True); s.set_defaults(fn=cmd_waive)
     s = sub.add_parser("downgrade", parents=[common], help="(parent) lower a claim's strength; reason required")
