@@ -2,7 +2,7 @@
 
 A [Hermes](https://hermes-agent.nousresearch.com/docs) skill. Describe a research **domain** and **direction** as traits; the skill composes a fitting workflow from a block catalog, stores it in a library, and runs it on a local data lake (SQLite ledger + Parquet + DuckDB) using waves of subagents. Every subagent output is file-based and machine-verified on load (quotes, SQL, receipts) before it enters the ledger. Results feed back into the library (Forge, Lab, Crew, Retro).
 
-한국어: 연구 도메인·방향을 특성(traits)으로 서술하면 블록 카탈로그에서 맞는 workflow를 합성·저장하고, 로컬 데이터 레이크 위에서 서브에이전트 웨이브로 실행하는 Hermes 스킬입니다. 서브에이전트 산출물은 모두 파일로 받아 인용·SQL·수신증을 기계 검증한 뒤에만 원장에 적재합니다.
+Summary (translated from the original Korean note): Describe a research domain and direction as traits, and the skill composes and stores a fitting workflow from the block catalog, then runs it with waves of subagents on a local data lake. All subagent outputs are received as files and are loaded into the ledger only after quotes, SQL, and receipts have been machine-verified.
 
 ## Layout
 

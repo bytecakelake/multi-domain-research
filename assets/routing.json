@@ -1,14 +1,14 @@
 {
   "_comment": "Role -> preferred delegate_task option names (verify against the LIVE option list every run; use `rlab next --available A,B,...`). Extractor.A and Extractor.B must come from different model families. Analyst and Adversary should differ in family.",
-  "Critic": {"tier": "deep", "prefer": ["F-Sol-Deep", "F-Sonnet-Debug"], "note": "workflow 비판: 독립 시각이 필요하므로 부모와 다른 계열 권장"},
-  "Scout": {"tier": "cheap", "prefer": ["M-Terra-Quick", "M-Haiku-Quick"], "note": "후보 목록만 반환"},
-  "Collector": {"tier": "balanced", "prefer": ["M-Terra-Balanced", "M-Haiku-Balanced"], "note": "원문 저장 + 메타데이터"},
+  "Critic": {"tier": "deep", "prefer": ["F-Sol-Deep", "F-Sonnet-Debug"], "note": "workflow critique: an independent view is needed, so a different model family from the parent is recommended"},
+  "Scout": {"tier": "cheap", "prefer": ["M-Terra-Quick", "M-Haiku-Quick"], "note": "returns the candidate list only"},
+  "Collector": {"tier": "balanced", "prefer": ["M-Terra-Balanced", "M-Haiku-Balanced"], "note": "saves source text + metadata"},
   "Extractor.A": {"tier": "cheap-extract", "prefer": ["M-Haiku-Balanced", "M-Terra-Balanced"], "note": "coder A"},
-  "Extractor.B": {"tier": "cheap-extract", "prefer": ["L-GLM-Extract", "M-Qwen-Lite", "M-DeepSeekPro-Plain"], "note": "coder B: A와 다른 계열"},
+  "Extractor.B": {"tier": "cheap-extract", "prefer": ["L-GLM-Extract", "M-Qwen-Lite", "M-DeepSeekPro-Plain"], "note": "coder B: a different model family from A"},
   "Extractor": {"tier": "cheap-extract", "prefer": ["M-Haiku-Balanced", "M-Terra-Balanced"], "note": "fallback"},
-  "DataAnalyst": {"tier": "reason", "prefer": ["M-Terra-Deep", "M-DeepSeekPro-Reason", "F-Sonnet-Code"], "note": "SQL 작성·검증"},
-  "Analyst": {"tier": "standard", "prefer": ["F-Sol-Standard", "M-Terra-Deep"], "note": "근거 ID만으로 주장 작성"},
-  "Adversary": {"tier": "deep", "prefer": ["F-Sol-Deep", "F-Sonnet-Debug"], "note": "분석자와 다른 계열·웹 검색 가능해야 함"},
-  "Auditor": {"tier": "standard", "prefer": ["M-Terra-Balanced", "F-Sol-Standard"], "note": "통계·메타 감사"},
-  "Reviewer": {"tier": "deep", "prefer": ["F-Sol-Deep", "F-Sonnet-Debug"], "note": "산출물 독립 검토"}
+  "DataAnalyst": {"tier": "reason", "prefer": ["M-Terra-Deep", "M-DeepSeekPro-Reason", "F-Sonnet-Code"], "note": "SQL writing and verification"},
+  "Analyst": {"tier": "standard", "prefer": ["F-Sol-Standard", "M-Terra-Deep"], "note": "writes claims from evidence IDs only"},
+  "Adversary": {"tier": "deep", "prefer": ["F-Sol-Deep", "F-Sonnet-Debug"], "note": "a different model family from the analyst; must be able to search the web"},
+  "Auditor": {"tier": "standard", "prefer": ["M-Terra-Balanced", "F-Sol-Standard"], "note": "statistics and meta audit"},
+  "Reviewer": {"tier": "deep", "prefer": ["F-Sol-Deep", "F-Sonnet-Debug"], "note": "independent review of the deliverable"}
 }

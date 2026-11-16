@@ -75,7 +75,7 @@ def g_kappa(run, block=None):
             pick = lambda ls: sorted(Counter(ls).items(), key=lambda kv: (-kv[1], kv[0]))[0][0]  # noqa: E731
             pairs.append((pick(u["A"]), pick(u["B"])))
     if len(pairs) < 5:
-        return _res("kappa", "na", None, thr, f"overlap units={len(pairs)} (<5): 겹치는 코딩 단위가 부족합니다")
+        return _res("kappa", "na", None, thr, f"overlap units={len(pairs)} (<5): too few overlapping coding units")
     k = cohen_kappa(pairs)
     agree = sum(a == b for a, b in pairs) / len(pairs)
     return _res("kappa", "pass" if k >= thr else "fail", round(k, 3), thr, f"units={len(pairs)} agreement={agree:.2f}")
@@ -168,7 +168,7 @@ LIMITS_HEADING = re.compile(r"(?im)^#{1,6}[ \t]*(?:\d+(?:\.\d+)*[.)]?[ \t]*)?[^\
 def g_citation(run, block=None):
     path = run.p("reports", "deliverable.md")
     if not path.exists():
-        return _res("citation", "fail", None, None, "reports/deliverable.md 없음")
+        return _res("citation", "fail", None, None, "reports/deliverable.md missing")
     text = path.read_text(encoding="utf-8")
     cited = set()
     for m in KREF.finditer(text):
@@ -181,11 +181,11 @@ def g_citation(run, block=None):
     if unknown:
         problems.append("unknown claim ids: " + ", ".join(unknown[:10]))
     if not has_lim:
-        problems.append("limitations/한계 절 없음")
+        problems.append("no limitations section (limitations/한계/제한)")
     if not cited:
-        problems.append("인용된 claim 없음")
+        problems.append("no cited claims")
     return _res("citation", "fail" if problems else "pass", f"cited={len(cited)}", "all cited ids exist + limitations",
-                "; ".join(problems) + ("; " if problems else "") + f"uncited_lines={len(uncited)} (정보용)")
+                "; ".join(problems) + ("; " if problems else "") + f"uncited_lines={len(uncited)} (informational)")
 
 
 def g_pii(run, block=None):

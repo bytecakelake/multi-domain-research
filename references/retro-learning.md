@@ -1,25 +1,25 @@
-# Retro: 라이브러리로 환류하는 방식과 한계
+# Retro: How Results Feed Back into the Library, and Its Limits
 
-## 무엇이 저장되는가 (`<lab home>/registry.sqlite`, `workflows/`)
+## What is stored (`<lab home>/registry.sqlite`, `workflows/`)
 
-- `workflows`: id(`name-vN`), parent(리네지), domain/direction 라벨, traits, spec 경로.
-- `runs`: run_id, workflow_id, metrics(JSON), `score`(사용자 0-5, 선택), `proxy`(프로세스 지표 0-1).
-- `lessons`: `lesson`(사람이 쓴 교훈) 및 `mutation`(규칙 기반 변이 제안), 태그=mode·domain·direction·사용자 태그.
+- `workflows`: id (`name-vN`), parent (lineage), domain/direction labels, traits, spec path.
+- `runs`: run_id, workflow_id, metrics (JSON), `score` (user rating 0-5, optional), `proxy` (process metric 0-1).
+- `lessons`: `lesson` (a lesson written by a person) and `mutation` (a rule-based mutation suggestion); tags = mode, domain, direction, and user tags.
 
-## 다음 forge가 쓰는 방식
+## How the next forge uses it
 
-`forge`/`wf match`는 저장 workflow들과 traits 거리를 계산하고(동률이면 fitness 높은 것 우선), 거리 ≤0.25인 후보가 없으면 `novel`로 표시해 workflow-critic를 켭니다. 매칭된 workflow의 교훈과 같은 mode·domain·direction 태그의 교훈이 정보로 출력됩니다. **자동으로 workflow를 고치지는 않습니다.** 부모가 제안을 읽고 `forge --fork <id> --set/--add/--drop`으로 새 버전을 만듭니다.
+`forge`/`wf match` compute the traits distance to the stored workflows (on a tie, the one with higher fitness wins). If no candidate has distance ≤0.25, the result is marked `novel` and workflow-critic is turned on. Lessons of the matched workflow, and lessons carrying the same mode/domain/direction tags, are printed as information. **Workflows are not modified automatically.** The parent reads the suggestions and creates a new version with `forge --fork <id> --set/--add/--drop`.
 
-## fitness는 무엇인가 (정직하게)
+## What fitness is (honestly)
 
-- `score`(사용자 평가)가 있으면 `score/5`, 없으면 `proxy`를 사용하고 평균합니다.
-- `proxy` = 0.35×(게이트 통과 비율; waived는 0.5) + 0.25×(주장 지지 점수: supported 1, partial 0.6, contested 0.3) + 0.2×(1−5×거부율) + 0.2×(1−재작업률). **결과의 진실성이 아니라 실행 프로세스의 건전성 지표입니다.** run이 적을 때는 순위를 결정하는 근거로 쓰지 마십시오(유사도가 같은데 점수가 다른 두 후보를 고를 때의 타이브레이커 정도).
-- 정확도·비용 절감 같은 효과는 실측 전에 주장하지 마십시오. 비용은 현재 task 수·재작업률만 기록합니다(토큰·금액은 기록하지 않음).
+- If `score` (user rating) exists, use `score/5`; otherwise use `proxy`; then average.
+- `proxy` = 0.35×(gate pass ratio; waived counts as 0.5) + 0.25×(claim support score: supported 1, partial 0.6, contested 0.3) + 0.2×(1−5×reject rate) + 0.2×(1−rework rate). **It is a health indicator of the execution process, not of the truthfulness of the results.** When there are few runs, do not use it as the basis for ranking (at most a tiebreaker when choosing between two candidates with equal similarity but different scores).
+- Do not claim effects such as accuracy or cost savings before they are measured. Cost currently records only the task count and rework rate (tokens and money are not recorded).
 
-## 변이 제안 규칙 (`runtime.suggestions`)
+## Mutation suggestion rules (`runtime.suggestions`)
 
-coverage 실패 → scout 레인 추가/max_waves ↑ · kappa 실패 → label_defs·batch_size↓·overlap_frac↑ · saturation 미달 → max_waves↑ · independence 실패 → source-audit 추가 · challenge 미완 → adversary batch↓ · 거부율>10% → 계약 보강·모델↑ · 재작업률>30% → 해당 role 라우팅↑ · contested 존재 → rival-hypotheses·bias-audit 추가.
+coverage failure → add scout lanes / raise max_waves · kappa failure → label_defs, lower batch_size, raise overlap_frac · saturation not reached → raise max_waves · independence failure → add source-audit · challenge incomplete → lower adversary batch · reject rate >10% → strengthen the contract, upgrade the model · rework rate >30% → upgrade routing for that role · contested present → add rival-hypotheses and bias-audit.
 
-## 교훈 작성 기준
+## Criteria for writing lessons
 
-일회성 사실이 아니라 **재사용 가능한 규칙 + 왜**를 한 줄로(예: "커뮤니티 레인은 tier 4로만 쓰고 coverage 세에서 제외: 홍보글 재인용이 독립 출처로 집계되었음"). `--tag`로 domain/direction 외 태그를 다면 다른 workflow에서도 매칭됩니다. 재사용 가능한 절차 개선은 이 스킬(`SKILL.md`·`references/`)에 반영하고, run 상태는 원장에 남깁니다.
+Write not a one-off fact but a **reusable rule + the why** in one line (e.g. "Use the community lane only as tier 4 and exclude it from the coverage count: re-quotes of promotional posts were counted as independent sources"). If you attach tags other than domain/direction with `--tag`, it also matches in other workflows. Reflect reusable procedure improvements in this skill (`SKILL.md`, `references/`), and keep run state in the ledger.

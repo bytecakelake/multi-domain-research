@@ -34,18 +34,18 @@ CTYPES = {
     "design": ["fact", "measurement", "interpretation", "inference"],
 }
 LANE_DEFS = {
-    "web": [("web-primary", "공식·1차 웹 출처: 공식 사이트, 원문 문서, 발표 자료, 일차 기록"),
-            ("web-independent", "독립 보도·분석·리뷰: 당사자가 아닌 제3자 출처")],
-    "academic": [("academic", "논문·학술 DB. 리뷰 논문을 먼저 찾고 인용을 따라간다")],
-    "social": [("community", "포럼·커뮤니티·댓글. tier 4로 표기하고 여론·인식의 증거로만 쓴다")],
-    "tabular": [("datasets", "공개 데이터셋·통계 포털·API 덤프 (kind=dataset으로 수집)")],
-    "code": [("repos", "저장소·릴리스 노트·이슈·벤치마크 코드")],
-    "media": [("media-transcripts", "영상·음성의 자막/전사 원문")],
-    "legal": [("statutes-cases", "법령·판례·행정 문서 원문")],
-    "human_subject": [("firsthand", "당사자 1차 진술: 인터뷰·자기 서술")],
-    "local": [("local-corpus", "사용자가 이미 가진 로컬 자료(파일·노트·내부 문서). 웹 탐색 없이 지정된 경로에서만 후보를 만든다")],
+    "web": [("web-primary", "Official/primary web sources: official sites, original documents, announcements, primary records"),
+            ("web-independent", "Independent reporting, analysis, reviews: third-party sources, not the parties involved")],
+    "academic": [("academic", "Papers and academic DBs. Find review papers first, then follow citations")],
+    "social": [("community", "Forums, communities, comments. Mark as tier 4 and use only as evidence of public opinion/perception")],
+    "tabular": [("datasets", "Public datasets, statistics portals, API dumps (collected as kind=dataset)")],
+    "code": [("repos", "Repositories, release notes, issues, benchmark code")],
+    "media": [("media-transcripts", "Original captions/transcripts of video and audio")],
+    "legal": [("statutes-cases", "Original statutes, case law, administrative documents")],
+    "human_subject": [("firsthand", "Firsthand statements from the parties: interviews, self-descriptions")],
+    "local": [("local-corpus", "Local material the user already has (files, notes, internal documents). Candidates come only from the given paths, with no web exploration")],
 }
-COUNTER_LANE = ("counter-view", "반대 관점·비판·실패 사례를 의도적으로 찾는다(확증 편향 차단)")
+COUNTER_LANE = ("counter-view", "Deliberately seek opposing views, criticism, and failure cases (to block confirmation bias)")
 TRIM_ORDER = ["qa-review", "bias-audit", "rival-hypotheses", "workflow-critic", "source-audit", "timeline-build", "compare-matrix"]
 DIST_W = {"mode": 0.30, "modality": 0.15, "verifiability": 0.10, "stakes": 0.10, "quant": 0.10,
           "volatility": 0.05, "noise": 0.05, "volume": 0.05, "ethics": 0.05, "access": 0.05}
@@ -117,11 +117,11 @@ def eval_when(node, ctx: dict) -> bool:
 
 def pred_text(node) -> str:
     if node == "always" or node is True:
-        return "항상 포함"
+        return "always included"
     if "all" in node:
-        return " 그리고 ".join(pred_text(n) for n in node["all"])
+        return " and ".join(pred_text(n) for n in node["all"])
     if "any" in node:
-        return " 또는 ".join(pred_text(n) for n in node["any"])
+        return " or ".join(pred_text(n) for n in node["any"])
     if "not" in node:
         return "NOT(" + pred_text(node["not"]) + ")"
     op = next(k for k in ("eq", "ne", "in", "has", "gte", "lte") if k in node)
@@ -196,7 +196,7 @@ def estimate(blocks: list[dict], params: dict) -> dict:
             per[b["id"]] = 1
     total = sum(per.values())
     return {"dispatch_tasks": total, "per_block": per,
-            "basis": f"sources~{n_src}, questions~{nq}, lanes={lanes}; 실측이 아니라 계획용 추정치"}
+            "basis": f"sources~{n_src}, questions~{nq}, lanes={lanes}; planning estimate, not a measurement"}
 
 
 def _topo(blocks: list[dict]) -> list[dict]:
@@ -262,14 +262,14 @@ def forge(traits_raw: dict | None, parent: dict | None = None, add=(), drop=(), 
         if b["id"] in ov["drop"]:
             if b.get("core"):
                 die(f"block '{b['id']}' is core and cannot be dropped")
-            ok, reason = False, "사용자 제외(--drop)"
+            ok, reason = False, "excluded by user (--drop)"
         if b["id"] in ov["add"]:
-            ok, reason = True, "사용자 추가(--add)"
+            ok, reason = True, "added by user (--add)"
         if ok:
             chosen.append(json.loads(json.dumps(b)))
             why[b["id"]] = reason
         else:
-            excluded.append({"id": b["id"], "reason": f"조건 불충족: {reason}" if b["id"] not in ov["drop"] else reason})
+            excluded.append({"id": b["id"], "reason": f"condition not met: {reason}" if b["id"] not in ov["drop"] else reason})
 
     params = derive_params(t)
     trimmed: list[str] = []
@@ -302,9 +302,9 @@ def forge(traits_raw: dict | None, parent: dict | None = None, add=(), drop=(), 
                 blocks = finalize(chosen)
                 est = estimate(blocks, params)["dispatch_tasks"]
         if est > t["budget_tasks"]:
-            warnings.append(f"예산 {t['budget_tasks']} 초과 추정 {est}: volume을 낮추거나 질문을 줄이십시오")
+            warnings.append(f"estimate {est} exceeds budget {t['budget_tasks']}: lower volume or reduce questions")
     for tid in trimmed:
-        excluded.append({"id": tid, "reason": "예산 초과로 트리밍"})
+        excluded.append({"id": tid, "reason": "trimmed for exceeding budget"})
         why.pop(tid, None)
 
     ids = [b["id"] for b in blocks]
@@ -355,8 +355,8 @@ def render_md(spec: dict) -> str:
     L.append(f"- traits: modality={t['modality']}, verifiability={t['verifiability']}, stakes={t['stakes']}, volume={t['volume']}, "
              f"volatility={t['volatility']}, noise={t['noise']}, ethics={t['ethics']}, access={t['access']}, quant={t['quant']}, temporal={t['temporal']}")
     est = spec["estimate"]
-    L.append(f"- 계획용 추정 dispatch: ~{est['dispatch_tasks']} tasks ({est['basis']})")
-    L += ["", "## Blocks (실행 순서)", "", "| # | block | phase | role | fanout | needs | gates | why |", "|---|---|---|---|---|---|---|---|"]
+    L.append(f"- Planning-estimate dispatch: ~{est['dispatch_tasks']} tasks ({est['basis']})")
+    L += ["", "## Blocks (execution order)", "", "| # | block | phase | role | fanout | needs | gates | why |", "|---|---|---|---|---|---|---|---|"]
     for i, b in enumerate(spec["blocks"], 1):
         g = ",".join(b["gates"]) + ((" (soft: " + ",".join(b["soft_gates"]) + ")") if b["soft_gates"] else "")
         L.append(f"| {i} | {b['id']} | {b['phase']} | {b['role']} | {b['fanout']} | {','.join(b['needs']) or '-'} | {g or '-'} | {b['why']} |")
